@@ -31,6 +31,7 @@ use aes_gcm::{
 };
 use anyhow::{Result, anyhow};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
+use sha2::{Digest, Sha256};
 
 /// The result of encrypting a secret for multiple recipients.
 /// Contains the encrypted payload and per-recipient wrapped keys.
@@ -195,6 +196,24 @@ fn unwrap_key(
     unwrapped
         .try_into()
         .map_err(|_| anyhow!("unwrapped key has incorrect length"))
+}
+
+/// Compute SHA-256 fingerprint of a public key.
+/// Returns formatted hex: "A7F2 3D4E 91BC 8F0A E2C1 7B5D 4F9A 8E3C"
+pub fn fingerprint(public_key: &PublicKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(public_key.as_bytes());
+    let hash = hasher.finalize();
+
+    // First 16 bytes as space-separated 4-char hex groups
+    hash.iter()
+        .take(16)
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .map(|c| c.join(""))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -385,5 +404,50 @@ mod tests {
             &encrypted.wrapped_keys[1],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_deterministic() {
+        let secret = SecretKey::generate(&mut OsRng);
+        let public = secret.public_key();
+
+        let fp1 = fingerprint(&public);
+        let fp2 = fingerprint(&public);
+
+        assert_eq!(fp1, fp2, "Same key should produce same fingerprint");
+    }
+
+    #[test]
+    fn test_fingerprint_different_keys() {
+        let secret1 = SecretKey::generate(&mut OsRng);
+        let public1 = secret1.public_key();
+
+        let secret2 = SecretKey::generate(&mut OsRng);
+        let public2 = secret2.public_key();
+
+        let fp1 = fingerprint(&public1);
+        let fp2 = fingerprint(&public2);
+
+        assert_ne!(fp1, fp2, "Different keys should produce different fingerprints");
+    }
+
+    #[test]
+    fn test_fingerprint_format() {
+        let secret = SecretKey::generate(&mut OsRng);
+        let public = secret.public_key();
+
+        let fp = fingerprint(&public);
+
+        // Should be 8 groups of 4 hex chars separated by spaces
+        let groups: Vec<&str> = fp.split(' ').collect();
+        assert_eq!(groups.len(), 8, "Should have 8 groups");
+
+        for group in groups {
+            assert_eq!(group.len(), 4, "Each group should be 4 chars");
+            assert!(
+                group.chars().all(|c| c.is_ascii_hexdigit()),
+                "Each char should be a hex digit"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod credentials;
 mod crypto;
+mod known_keys;
 mod ui;
 mod version;
 

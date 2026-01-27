@@ -13,10 +13,12 @@ use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use crypto_box::SecretKey;
+use dialoguer::{Confirm, theme::ColorfulTheme};
 use humantime::parse_duration;
+use owo_colors::OwoColorize;
 use shared::api::{CreateDropPayload, WrappedKeyPayload};
 
-use crate::{api::Api, config::Config, credentials, crypto, ui};
+use crate::{api::Api, config::Config, credentials, crypto, known_keys, ui};
 
 pub async fn run(
     config: &Config,
@@ -85,6 +87,87 @@ pub async fn run(
         .collect();
     let recipient_public_keys = recipient_public_keys?;
 
+    // Compute fingerprints and group by email
+    let mut fingerprints_by_email: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for (rk, pub_key) in recipient_keys.iter().zip(&recipient_public_keys) {
+        let fp = crypto::fingerprint(pub_key);
+        fingerprints_by_email
+            .entry(rk.email.clone())
+            .or_default()
+            .push(fp);
+    }
+
+    // TOFU key verification - check all keys for each recipient
+    let mut known = known_keys::load();
+
+    for email in recipients {
+        let fps = match fingerprints_by_email.get(email) {
+            Some(fps) => fps,
+            None => continue,
+        };
+
+        match known.check(email, fps) {
+            known_keys::KeyCheckResult::FirstContact => {
+                // Silently pin all keys on first contact
+                known.pin_all(email, fps);
+            }
+            known_keys::KeyCheckResult::Trusted => {
+                // All keys match - nothing to do
+            }
+            known_keys::KeyCheckResult::NewKeys { new } => {
+                // New device keys detected - warn and prompt
+                eprintln!();
+                ui::warning(&format!("New device key(s) for {}", ui::bold(email)));
+                for fp in &new {
+                    eprintln!("  New: {}", ui::fingerprint(fp));
+                }
+                eprintln!();
+                ui::hint("They may have added a new device, or this could be a MITM attack.");
+                eprintln!();
+
+                let proceed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Trust new key(s)?")
+                    .default(false)
+                    .interact()?;
+
+                if !proceed {
+                    return Err(anyhow!("Aborted: new keys not trusted"));
+                }
+
+                // Add the new keys
+                known.add_keys(email, &new);
+            }
+            known_keys::KeyCheckResult::KeysMissing { missing } => {
+                // Previously pinned keys are missing - warn and prompt
+                eprintln!();
+                ui::warning(&format!("Missing device key(s) for {}", ui::bold(email)));
+                for fp in &missing {
+                    eprintln!("  Missing: {}", fp.dimmed());
+                }
+                eprintln!();
+                ui::hint("They may have removed a device, or this could indicate key compromise.");
+                eprintln!();
+
+                let proceed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Continue anyway?")
+                    .default(false)
+                    .interact()?;
+
+                if !proceed {
+                    return Err(anyhow!("Aborted: missing keys"));
+                }
+
+                // Update to current key set
+                known.pin_all(email, fps);
+            }
+        }
+    }
+
+    // Save any new/updated keys
+    known_keys::save(&known)?;
+
     // Encrypt the secret
     let encrypted = crypto::encrypt_drop(
         secret.as_bytes(),
@@ -123,6 +206,20 @@ pub async fn run(
     .await?;
 
     ui::success(&format!("Sent! Drop ID: {}", ui::bold(&response.id)));
+
+    // Display recipient fingerprints (one per email, show first)
+    for email in recipients {
+        if let Some(fps) = fingerprints_by_email.get(email)
+            && let Some(fp) = fps.first()
+        {
+            let suffix = if fps.len() > 1 {
+                format!(" (+{} devices)", fps.len() - 1)
+            } else {
+                String::new()
+            };
+            eprintln!("  {}: {}{}", email, ui::fingerprint(fp), suffix.dimmed());
+        }
+    }
 
     Ok(())
 }
