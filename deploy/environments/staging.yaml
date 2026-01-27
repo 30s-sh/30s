@@ -1,0 +1,4 @@
+# Staging application deployment
+# Deploy with: helmfile -e staging sync
+
+namespace: staging

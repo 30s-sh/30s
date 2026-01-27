@@ -1,0 +1,4 @@
+# Cluster-wide infrastructure (ingress, cert-manager, doppler, logging)
+#
+# Deploy with:
+#   helmfile -e cluster sync --state-values-set betterstack.collectorSecret=xxx

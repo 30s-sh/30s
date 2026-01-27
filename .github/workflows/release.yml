@@ -1,0 +1,68 @@
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: 30s-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: 30s-linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: 30s-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --package cli
+      - run: mv target/release/cli ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+      - run: sudo apt-get install -y s3cmd
+      - run: |
+          cat > ~/.s3cfg << EOF
+          [default]
+          access_key = ${{ secrets.DO_SPACES_ACCESS_KEY }}
+          secret_key = ${{ secrets.DO_SPACES_SECRET_KEY }}
+          host_base = sfo3.digitaloceanspaces.com
+          host_bucket = %(bucket)s.sfo3.digitaloceanspaces.com
+          EOF
+      - run: |
+          cd binaries
+          sha256sum * > checksums.txt
+          cat checksums.txt
+      - run: |
+          VERSION="${{ github.ref_name }}"
+          for file in binaries/*; do
+            filename=$(basename "$file")
+            s3cmd put "$file" "s3://30s-releases/cli/${VERSION}/${filename}" --acl-public
+          done
+          s3cmd put binaries/checksums.txt "s3://30s-releases/cli/${VERSION}/checksums.txt" --acl-public
+      - run: |
+          echo "${{ github.ref_name }}" > latest.txt
+          s3cmd put latest.txt s3://30s-releases/latest.txt --acl-public

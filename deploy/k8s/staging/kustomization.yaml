@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: staging
+
+resources:
+  - ../base
+  - doppler-secret.yaml
+  - issuer.yaml
+  - certificate.yaml
+  - ingress.yaml
+
+images:
+  - name: 30s-api
+    newName: ghcr.io/30s-sh/30s-api
+    newTag: v0.1.0

@@ -1,0 +1,64 @@
+environments:
+  cluster:
+    values:
+      - environments/cluster.yaml
+  staging:
+    values:
+      - environments/staging.yaml
+  production:
+    values:
+      - environments/production.yaml
+
+---
+
+repositories:
+  - name: ingress-nginx
+    url: https://kubernetes.github.io/ingress-nginx
+  - name: jetstack
+    url: https://charts.jetstack.io
+  - name: doppler
+    url: https://helm.doppler.com
+  - name: better-stack
+    url: https://betterstackhq.github.io/collector-helm-chart
+
+releases:
+  # ============================================================================
+  # Cluster-wide infrastructure (deploy with: helmfile -e cluster sync)
+  # ============================================================================
+
+  - name: ingress-nginx
+    namespace: ingress-nginx
+    createNamespace: true
+    chart: ingress-nginx/ingress-nginx
+    version: 4.14.1
+    installed: {{ eq .Environment.Name "cluster" }}
+    values:
+      - helm-values/ingress-nginx.yaml
+
+  - name: cert-manager
+    namespace: cert-manager
+    createNamespace: true
+    chart: jetstack/cert-manager
+    version: 1.19.2
+    installed: {{ eq .Environment.Name "cluster" }}
+    set:
+      - name: crds.enabled
+        value: true
+
+  - name: doppler-operator
+    namespace: doppler-operator-system
+    createNamespace: true
+    chart: doppler/doppler-kubernetes-operator
+    version: 1.7.1
+    installed: {{ eq .Environment.Name "cluster" }}
+
+  - name: better-stack-collector
+    namespace: logging
+    createNamespace: true
+    chart: better-stack/collector
+    installed: {{ eq .Environment.Name "cluster" }}
+    values:
+      - helm-values/betterstack-collector.yaml
+    set:
+      - name: collector.env.COLLECTOR_SECRET
+        value: {{ .Values.betterstack.collectorSecret | quote }}

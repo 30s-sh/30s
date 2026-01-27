@@ -1,0 +1,9 @@
+# Default configuration for ingress-nginx on DigitalOcean
+controller:
+  service:
+    annotations:
+      # Use DigitalOcean Load Balancer
+      service.beta.kubernetes.io/do-loadbalancer-name: "30s-ingress"
+      service.beta.kubernetes.io/do-loadbalancer-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-tls-ports: "443"
+      service.beta.kubernetes.io/do-loadbalancer-http-ports: "80"

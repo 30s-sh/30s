@@ -1,0 +1,4 @@
+# Production application deployment
+# Deploy with: helmfile -e production sync
+
+namespace: production

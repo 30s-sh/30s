@@ -1,0 +1,25 @@
+# devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# claude
+CLAUDE.md
+.claude
+
+# rust
+/target
+
+# system
+.DS_Store
+
+# etc
+.env
+deploy/k8s/local/secrets.yaml
+latest.txt
