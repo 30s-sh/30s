@@ -1,0 +1,3 @@
+kind: Added
+body: added warning before device deletion if inbox has pending drops.
+time: 2026-01-27T15:28:52.863466-06:00
