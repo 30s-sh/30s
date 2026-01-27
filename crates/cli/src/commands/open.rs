@@ -10,8 +10,10 @@
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crypto_box::{PublicKey, SecretKey};
+use dialoguer::{Confirm, theme::ColorfulTheme};
+use owo_colors::OwoColorize;
 
-use crate::{api::Api, config::Config, credentials, crypto, ui};
+use crate::{api::Api, config::Config, credentials, crypto, known_keys, ui};
 
 pub async fn run(config: &Config, drop_id: String) -> Result<()> {
     let api = Api::new(config.api_url.to_string());
@@ -35,6 +37,70 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
         <[u8; 32]>::try_from(sender_public_key_bytes.as_slice())
             .map_err(|_| anyhow!("Invalid sender public key length"))?,
     );
+
+    // TOFU key verification - check sender key against known keys
+    let sender_fp = crypto::fingerprint(&sender_public_key);
+    let fps = vec![sender_fp.clone()];
+    let mut known = known_keys::load();
+
+    match known.check(&drop.sender_email, &fps) {
+        known_keys::KeyCheckResult::FirstContact => {
+            // Silently pin on first contact
+            known.pin_all(&drop.sender_email, &fps);
+            known_keys::save(&known)?;
+        }
+        known_keys::KeyCheckResult::Trusted => {
+            // Key matches - nothing to do
+        }
+        known_keys::KeyCheckResult::NewKeys { new } => {
+            // This shouldn't happen when opening (we only have one key from sender)
+            // but handle it anyway
+            eprintln!();
+            ui::warning(&format!("New device key(s) for {}", ui::bold(&drop.sender_email)));
+            for fp in &new {
+                eprintln!("  New: {}", ui::fingerprint(fp));
+            }
+            eprintln!();
+            ui::hint("They may have added a new device, or this could be a MITM attack.");
+            eprintln!();
+
+            let proceed = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Trust new key?")
+                .default(false)
+                .interact()?;
+
+            if !proceed {
+                return Err(anyhow!("Aborted: new key not trusted"));
+            }
+
+            known.add_keys(&drop.sender_email, &new);
+            known_keys::save(&known)?;
+        }
+        known_keys::KeyCheckResult::KeysMissing { missing } => {
+            // Sender's key changed - warn and prompt
+            eprintln!();
+            ui::warning(&format!("Missing device key(s) for {}", ui::bold(&drop.sender_email)));
+            for fp in &missing {
+                eprintln!("  Missing: {}", fp.dimmed());
+            }
+            eprintln!();
+            ui::hint("They may have removed a device, or this could indicate key compromise.");
+            eprintln!();
+
+            let proceed = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Continue anyway?")
+                .default(false)
+                .interact()?;
+
+            if !proceed {
+                return Err(anyhow!("Aborted: key mismatch"));
+            }
+
+            // Update to current key
+            known.pin_all(&drop.sender_email, &fps);
+            known_keys::save(&known)?;
+        }
+    }
 
     // Decode ciphertext and AES nonce (shared by all recipients)
     let ciphertext = BASE64.decode(&drop.ciphertext)?;
@@ -78,6 +144,11 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
     let plaintext = plaintext.ok_or_else(|| {
         anyhow!("Could not decrypt this drop. It may have been sent to a different device.")
     })?;
+
+    // Display sender info with fingerprint
+    ui::info(&format!("From {}", ui::bold(&drop.sender_email)));
+    eprintln!("  Key: {}", ui::fingerprint(&sender_fp));
+    eprintln!();
 
     // Display the secret
     let secret = String::from_utf8(plaintext)?;

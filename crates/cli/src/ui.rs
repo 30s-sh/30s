@@ -22,14 +22,24 @@ fn error(msg: &str) {
     eprintln!("{} {}", "✗".red(), msg);
 }
 
+/// Print a warning message with yellow icon.
+pub fn warning(msg: &str) {
+    eprintln!("{} {}", "⚠".yellow(), msg.yellow());
+}
+
 /// Print a hint/suggestion (dimmed, indented).
-fn hint(msg: &str) {
+pub fn hint(msg: &str) {
     eprintln!("  {} {}", "→".dimmed(), msg.dimmed());
 }
 
 /// Format a value as bold (for IDs, emails, etc.).
 pub fn bold(s: &str) -> String {
     s.bold().to_string()
+}
+
+/// Format a fingerprint in cyan for visibility.
+pub fn fingerprint(fp: &str) -> String {
+    fp.cyan().to_string()
 }
 
 /// Run an async operation with a spinner showing the given message.
