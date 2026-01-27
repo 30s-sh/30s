@@ -2,8 +2,6 @@
 
 > Encrypted handoffs in seconds.
 
-Stop pasting tokens in Slack. Send secrets securely with `30s` — they're encrypted on your device and auto-delete after expiration.
-
 ## Install
 
 ```bash
@@ -29,8 +27,6 @@ curl -sSL https://30s.sh/install.sh | sh
 30s open <drop-id>
 ```
 
-The secret is encrypted on your device before it ever leaves. The server only stores ciphertext. Recipients decrypt locally with their device key.
-
 ## Status
 
 ### Self-hosting
@@ -41,7 +37,7 @@ If you’d like to improve the self-hosting story, **PRs are welcome** (compose 
 
 ### AI usage (Claude)
 
-Claude was used to help with documentation and some straightforward app plumbing. **All AI-assisted changes were reviewed carefully.** Claude was **not** used to write the sensitive cryptography parts (encryption/decryption, key handling, protocol design), which were implemented manually and reviewed with extra care.
+Claude was used to help with documentation and some straightforward app plumbing. **All AI-assisted changes were reviewed carefully.** Claude was **not** used to write the sensitive cryptography parts (encryption/decryption, key handling, protocol design), which were implemented manually.
 
 ## License
 
