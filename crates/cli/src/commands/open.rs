@@ -83,5 +83,10 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
     let secret = String::from_utf8(plaintext)?;
     println!("{}", secret);
 
+    // Notify if this was a burn-after-reading drop
+    if drop.once {
+        ui::info("This secret was deleted after viewing.");
+    }
+
     Ok(())
 }

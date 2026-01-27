@@ -143,6 +143,7 @@ async fn create_drop(
         aes_nonce: payload.aes_nonce,
         wrapped_keys: payload.wrapped_keys,
         created_at,
+        once: payload.once,
     };
 
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
@@ -251,7 +252,30 @@ async fn get_drop(
         ));
     }
 
-    tracing::info!(drop_id = %id, user_id = %user.id, "drop accessed");
+    tracing::info!(drop_id = %id, user_id = %user.id, once = stored_drop.once, "drop accessed");
+
+    // If burn-after-reading is enabled, delete the drop after retrieval
+    if stored_drop.once {
+        // Delete the drop from Redis
+        let _: () = redis.del(&drop_key).await?;
+
+        // Remove from all recipients' inboxes
+        for wk in &stored_drop.wrapped_keys {
+            if let Some(recipient_user) = sqlx::query_as!(
+                User,
+                "SELECT * FROM users WHERE email = $1",
+                wk.recipient_email
+            )
+            .fetch_optional(&state.database)
+            .await?
+            {
+                let inbox_key = format!("inbox:{}", recipient_user.id);
+                let _: () = redis.zrem(&inbox_key, &id).await?;
+            }
+        }
+
+        tracing::info!(drop_id = %id, "drop burned after reading");
+    }
 
     // Convert to response format
     let drop = Drop {
@@ -262,6 +286,7 @@ async fn get_drop(
         aes_nonce: stored_drop.aes_nonce,
         wrapped_keys: stored_drop.wrapped_keys,
         created_at: stored_drop.created_at,
+        once: stored_drop.once,
     };
 
     Ok(Json(drop))

@@ -60,6 +60,10 @@ pub struct CreateDropPayload {
     /// When this drop expires and is automatically deleted.
     #[garde(custom(validate_expires_at))]
     pub expires_at: DateTime<Utc>,
+    /// Delete the drop after it's read once (burn-after-reading mode).
+    #[garde(skip)]
+    #[serde(default)]
+    pub once: bool,
 }
 
 fn validate_expires_at(value: &DateTime<Utc>, now: &DateTime<Utc>) -> garde::Result {
@@ -133,6 +137,9 @@ pub struct Drop {
     /// Per-recipient wrapped symmetric keys.
     pub wrapped_keys: Vec<WrappedKeyPayload>,
     pub created_at: DateTime<Utc>,
+    /// Whether this drop was deleted after being read (burn-after-reading mode).
+    #[serde(default)]
+    pub once: bool,
 }
 
 /// Current user info.
@@ -247,6 +254,7 @@ mod tests {
                     wrapped_key: "wrapped".into(),
                 }],
                 expires_at,
+                once: false,
             }
         }
 
@@ -312,6 +320,7 @@ mod tests {
                 aes_nonce: "nonce".into(),
                 wrapped_keys: vec![],
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_err());
@@ -329,6 +338,7 @@ mod tests {
                 aes_nonce: "nonce".into(),
                 wrapped_keys,
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_err());
@@ -346,6 +356,7 @@ mod tests {
                 aes_nonce: "nonce".into(),
                 wrapped_keys,
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_ok());
@@ -364,6 +375,7 @@ mod tests {
                     wrapped_key: "key".into(),
                 }],
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_err());
@@ -389,6 +401,7 @@ mod tests {
                     wrapped_key: "key".into(),
                 }],
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_err());
@@ -408,6 +421,7 @@ mod tests {
                     wrapped_key: "key".into(),
                 }],
                 expires_at: now + Duration::hours(1),
+                once: false,
             };
 
             assert!(payload.validate_with(&now).is_ok());

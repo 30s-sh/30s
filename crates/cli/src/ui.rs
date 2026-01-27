@@ -12,6 +12,11 @@ pub fn success(msg: &str) {
     println!("{} {}", "✓".green(), msg);
 }
 
+/// Print an info message with blue info icon.
+pub fn info(msg: &str) {
+    eprintln!("{} {}", "ℹ".blue(), msg);
+}
+
 /// Print an error message with red X.
 fn error(msg: &str) {
     eprintln!("{} {}", "✗".red(), msg);

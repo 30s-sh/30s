@@ -39,4 +39,7 @@ pub struct StoredDrop {
     /// Per-recipient wrapped symmetric keys
     pub wrapped_keys: Vec<WrappedKeyPayload>,
     pub created_at: DateTime<Utc>,
+    /// Delete the drop after it's read once (burn-after-reading mode).
+    #[serde(default)]
+    pub once: bool,
 }
