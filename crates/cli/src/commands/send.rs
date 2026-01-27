@@ -23,6 +23,7 @@ pub async fn run(
     recipients: &[String],
     expires_in: &str,
     secret: &str,
+    once: bool,
 ) -> Result<()> {
     // Read from stdin if message is "-"
     let secret = if secret == "-" {
@@ -115,6 +116,7 @@ pub async fn run(
                 aes_nonce: BASE64.encode(encrypted.aes_nonce),
                 wrapped_keys,
                 expires_at,
+                once,
             },
         ),
     )

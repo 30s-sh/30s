@@ -41,6 +41,7 @@ enum Commands {
     #[command(after_help = "Examples:
   30s send -t bob@example.com 'database password'
   30s send -t alice@example.com -t bob@example.com 'shared secret' 1h
+  30s send -t bob@example.com -o 'one-time secret'
   echo 'secret' | 30s send -t bob@example.com -")]
     Send {
         /// Recipient email (use multiple times for multiple recipients)
@@ -51,6 +52,9 @@ enum Commands {
         /// How long until the secret expires
         #[arg(default_value = "30s")]
         expires_in: String,
+        /// Delete the secret after it's read once
+        #[arg(short = 'o', long = "once")]
+        once: bool,
     },
 
     /// List drops in your inbox
@@ -156,7 +160,8 @@ async fn run() -> anyhow::Result<()> {
             to,
             message,
             expires_in,
-        } => commands::send::run(&config, &to, &expires_in, &message).await,
+            once,
+        } => commands::send::run(&config, &to, &expires_in, &message, once).await,
         Commands::Inbox => commands::inbox::run(&config).await,
         Commands::Open { id } => commands::open::run(&config, id).await,
         Commands::Delete { id } => commands::delete::run(&config, &id).await,
