@@ -1,6 +1,7 @@
 mod api;
 mod commands;
 mod config;
+mod contacts;
 mod credentials;
 mod crypto;
 mod known_keys;
@@ -45,7 +46,7 @@ enum Commands {
   30s send -t bob@example.com -o 'one-time secret'
   echo 'secret' | 30s send -t bob@example.com -")]
     Send {
-        /// Recipient email (use multiple times for multiple recipients)
+        /// Recipient email, alias, or @group (use multiple times for multiple recipients)
         #[arg(short = 't', long = "to", required = true)]
         to: Vec<String>,
         /// The secret to send (use '-' to read from stdin)
@@ -78,11 +79,47 @@ enum Commands {
 
     /// List or manage your registered devices
     #[command(after_help = "Examples:
-  30s devices                List all devices
-  30s devices delete <id>    Remove a device")]
+  30s devices                       List all devices
+  30s devices delete abc123-def456  Remove a device")]
     Devices {
         #[command(subcommand)]
         action: Option<DeviceCommands>,
+    },
+
+    /// Manage contact aliases for quick recipient lookup
+    #[command(after_help = "Examples:
+  30s alias                         List all aliases
+  30s alias bob                     Show what 'bob' maps to
+  30s alias bob bob@company.com     Add or update an alias
+  30s alias delete bob              Remove an alias")]
+    Alias {
+        #[command(subcommand)]
+        action: Option<AliasCommands>,
+
+        /// Alias name (when setting)
+        name: Option<String>,
+
+        /// Email address (when setting)
+        email: Option<String>,
+    },
+
+    /// Manage contact groups for sending to multiple recipients
+    #[command(after_help = "Examples:
+  30s groups                                   List all groups
+  30s groups team                              Show group members
+  30s groups team alice@co.com bob@co.com      Create/update a group
+  30s groups delete team                       Remove a group
+  30s send -t @team 'secret'                   Send to all group members")]
+    Groups {
+        #[command(subcommand)]
+        action: Option<GroupsCommands>,
+
+        /// Group name (when setting)
+        name: Option<String>,
+
+        /// Email addresses (when setting)
+        #[arg(trailing_var_arg = true)]
+        emails: Vec<String>,
     },
 
     /// Sign out of this device
@@ -128,6 +165,26 @@ enum DeviceCommands {
 }
 
 #[derive(Subcommand)]
+enum AliasCommands {
+    /// Remove an alias
+    #[command(after_help = "Example: 30s alias delete bob")]
+    Delete {
+        /// Alias name to delete
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupsCommands {
+    /// Remove a group
+    #[command(after_help = "Example: 30s groups delete team")]
+    Delete {
+        /// Group name to delete
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum RotateCommands {
     /// Rotate your API key (requires email verification)
     #[command(after_help = "Example: 30s rotate auth")]
@@ -162,13 +219,43 @@ async fn run() -> anyhow::Result<()> {
             message,
             expires_in,
             once,
-        } => commands::send::run(&config, &to, &expires_in, &message, once).await,
+        } => {
+            let contacts = contacts::load();
+            let expanded = contacts::expand_recipients(&to, &contacts)?;
+            commands::send::run(&config, &expanded, &expires_in, &message, once).await
+        }
         Commands::Inbox => commands::inbox::run(&config).await,
         Commands::Open { id } => commands::open::run(&config, id).await,
         Commands::Delete { id } => commands::delete::run(&config, &id).await,
         Commands::Devices { action } => match action {
             Some(DeviceCommands::Delete { id }) => commands::devices::delete(&config, &id).await,
             None => commands::devices::list(&config).await,
+        },
+        Commands::Alias {
+            action,
+            name,
+            email,
+        } => match action {
+            Some(AliasCommands::Delete { name }) => commands::alias::delete(&name).await,
+            None => match (name, email) {
+                (Some(n), Some(e)) => commands::alias::set(&n, &e).await,
+                (Some(n), None) => commands::alias::show(&n).await,
+                (None, None) => commands::alias::list().await,
+                (None, Some(_)) => unreachable!(),
+            },
+        },
+        Commands::Groups {
+            action,
+            name,
+            emails,
+        } => match action {
+            Some(GroupsCommands::Delete { name }) => commands::groups::delete(&name).await,
+            None => match (name, emails.is_empty()) {
+                (Some(n), false) => commands::groups::set(&n, &emails).await,
+                (Some(n), true) => commands::groups::show(&n).await,
+                (None, true) => commands::groups::list().await,
+                (None, false) => unreachable!(),
+            },
         },
         Commands::Logout => commands::logout::run().await,
         Commands::Destroy => commands::destroy::run(&config).await,

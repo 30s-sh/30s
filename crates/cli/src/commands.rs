@@ -1,6 +1,8 @@
+pub mod alias;
 pub mod delete;
 pub mod destroy;
 pub mod devices;
+pub mod groups;
 pub mod inbox;
 pub mod init;
 pub mod logout;
