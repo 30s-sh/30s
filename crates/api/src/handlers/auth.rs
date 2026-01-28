@@ -35,6 +35,34 @@ use shared::api::{
 
 use crate::{error::AppError, middleware::auth::AuthUser, models::User, state::AppState};
 
+/// Check rate limit using Redis INCR + EXPIRE pattern.
+/// Returns `Err(TOO_MANY_REQUESTS)` if limit exceeded.
+async fn check_rate_limit(
+    redis: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    limit: i64,
+    ttl_secs: u64,
+) -> Result<(), AppError> {
+    let count: i64 = redis::cmd("INCR").arg(key).query_async(redis).await?;
+
+    if count == 1 {
+        let _: () = redis::cmd("EXPIRE")
+            .arg(key)
+            .arg(ttl_secs)
+            .query_async(redis)
+            .await?;
+    }
+
+    if count > limit {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Try again later.",
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/code", post(request_code))
@@ -76,28 +104,13 @@ async fn request_code(
 
     // Rate limit: 5 code requests per hour per email
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let ratelimit_key = format!("ratelimit:code:{}", payload.email);
-
-    let count: i64 = redis::cmd("INCR")
-        .arg(&ratelimit_key)
-        .query_async(&mut redis)
-        .await?;
-
-    if count == 1 {
-        // First request - set 1 hour TTL
-        let _: () = redis::cmd("EXPIRE")
-            .arg(&ratelimit_key)
-            .arg(3600)
-            .query_async(&mut redis)
-            .await?;
-    }
-
-    if count > 5 {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many code requests. Try again later.",
-        ));
-    }
+    check_rate_limit(
+        &mut redis,
+        &format!("ratelimit:code:{}", payload.email),
+        5,
+        3600,
+    )
+    .await?;
 
     let code: String = {
         let mut rng = rand::rng();
@@ -146,28 +159,13 @@ async fn verify_code(
 
     // Rate limit: 10 verify attempts per 15 minutes per email
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let ratelimit_key = format!("ratelimit:verify:{}", payload.email);
-
-    let count: i64 = redis::cmd("INCR")
-        .arg(&ratelimit_key)
-        .query_async(&mut redis)
-        .await?;
-
-    if count == 1 {
-        // First attempt - set 15 minute TTL
-        let _: () = redis::cmd("EXPIRE")
-            .arg(&ratelimit_key)
-            .arg(15 * 60)
-            .query_async(&mut redis)
-            .await?;
-    }
-
-    if count > 10 {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many verification attempts. Try again later.",
-        ));
-    }
+    check_rate_limit(
+        &mut redis,
+        &format!("ratelimit:verify_code:{}", payload.email),
+        10,
+        15 * 60,
+    )
+    .await?;
 
     let mut hasher = Sha256::new();
     hasher.update(payload.code.as_bytes());
@@ -249,28 +247,13 @@ async fn request_rotate(
 ) -> Result<impl IntoResponse, AppError> {
     // Rate limit: 3 rotation code requests per hour per user
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let ratelimit_key = format!("ratelimit:rotate:{}", user.id);
-
-    let count: i64 = redis::cmd("INCR")
-        .arg(&ratelimit_key)
-        .query_async(&mut redis)
-        .await?;
-
-    if count == 1 {
-        // First request - set 1 hour TTL
-        let _: () = redis::cmd("EXPIRE")
-            .arg(&ratelimit_key)
-            .arg(3600)
-            .query_async(&mut redis)
-            .await?;
-    }
-
-    if count > 3 {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many rotation requests. Try again later.",
-        ));
-    }
+    check_rate_limit(
+        &mut redis,
+        &format!("ratelimit:rotate:{}", user.id),
+        3,
+        3600,
+    )
+    .await?;
 
     // Look up user's email
     let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
@@ -326,28 +309,13 @@ async fn verify_rotate(
 
     // Rate limit: 10 verify attempts per 15 minutes per user
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let ratelimit_key = format!("ratelimit:verify_rotate:{}", user.id);
-
-    let count: i64 = redis::cmd("INCR")
-        .arg(&ratelimit_key)
-        .query_async(&mut redis)
-        .await?;
-
-    if count == 1 {
-        // First attempt - set 15 minute TTL
-        let _: () = redis::cmd("EXPIRE")
-            .arg(&ratelimit_key)
-            .arg(15 * 60)
-            .query_async(&mut redis)
-            .await?;
-    }
-
-    if count > 10 {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many verification attempts. Try again later.",
-        ));
-    }
+    check_rate_limit(
+        &mut redis,
+        &format!("ratelimit:verify_rotate:{}", user.id),
+        10,
+        15 * 60,
+    )
+    .await?;
 
     // Look up user
     let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
