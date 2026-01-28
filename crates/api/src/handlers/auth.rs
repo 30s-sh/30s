@@ -247,6 +247,31 @@ async fn request_rotate(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Rate limit: 3 rotation code requests per hour per user
+    let mut redis = state.redis.get_multiplexed_async_connection().await?;
+    let ratelimit_key = format!("ratelimit:rotate:{}", user.id);
+
+    let count: i64 = redis::cmd("INCR")
+        .arg(&ratelimit_key)
+        .query_async(&mut redis)
+        .await?;
+
+    if count == 1 {
+        // First request - set 1 hour TTL
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&ratelimit_key)
+            .arg(3600)
+            .query_async(&mut redis)
+            .await?;
+    }
+
+    if count > 3 {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many rotation requests. Try again later.",
+        ));
+    }
+
     // Look up user's email
     let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
         .fetch_one(&state.database)
@@ -298,6 +323,31 @@ async fn verify_rotate(
     payload
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Rate limit: 10 verify attempts per 15 minutes per user
+    let mut redis = state.redis.get_multiplexed_async_connection().await?;
+    let ratelimit_key = format!("ratelimit:verify_rotate:{}", user.id);
+
+    let count: i64 = redis::cmd("INCR")
+        .arg(&ratelimit_key)
+        .query_async(&mut redis)
+        .await?;
+
+    if count == 1 {
+        // First attempt - set 15 minute TTL
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&ratelimit_key)
+            .arg(15 * 60)
+            .query_async(&mut redis)
+            .await?;
+    }
+
+    if count > 10 {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many verification attempts. Try again later.",
+        ));
+    }
 
     // Look up user
     let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
