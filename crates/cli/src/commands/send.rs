@@ -17,6 +17,7 @@ use dialoguer::{Confirm, theme::ColorfulTheme};
 use humantime::parse_duration;
 use owo_colors::OwoColorize;
 use shared::api::{CreateDropPayload, WrappedKeyPayload};
+use zeroize::Zeroize;
 
 use crate::{api::Api, config::Config, credentials, crypto, known_keys, ui};
 
@@ -42,11 +43,12 @@ pub async fn run(
     let api_key = credentials::get_api_key().await?;
 
     let private_key_b64 = credentials::get_private_key().await?;
-    let private_key_bytes = BASE64.decode(private_key_b64)?;
+    let mut private_key_bytes = BASE64.decode(private_key_b64)?;
     let sender_secret_key = SecretKey::from(
         <[u8; 32]>::try_from(private_key_bytes.as_slice())
             .map_err(|_| anyhow!("Invalid private key length"))?,
     );
+    private_key_bytes.zeroize();
     let sender_public_key = sender_secret_key.public_key();
 
     // Parse expiration duration (e.g., "30s", "5m", "1h", "7d")
