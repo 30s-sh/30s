@@ -4,6 +4,8 @@ metadata:
   name: api
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
 spec:
   ingressClassName: nginx
   tls:
