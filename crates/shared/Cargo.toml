@@ -7,3 +7,13 @@ edition.workspace = true
 chrono = { version = "0.4.43", features = ["serde"] }
 garde = { version = "0.22.1", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
+uuid = { version = "1.19.0", features = ["serde"] }
+
+[features]
+default = []
+sqlx = ["dep:sqlx"]
+
+[dependencies.sqlx]
+version = "0.8.6"
+features = ["chrono", "uuid"]
+optional = true

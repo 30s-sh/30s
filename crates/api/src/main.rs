@@ -1,4 +1,5 @@
 mod config;
+mod dns;
 mod email;
 mod error;
 mod handlers;
@@ -20,7 +21,7 @@ use tower_http::{
 };
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::Config, email::EmailSender, state::AppState};
+use crate::{config::Config, dns::HickoryDnsResolver, email::EmailSender, state::AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,11 +63,14 @@ async fn main() -> Result<()> {
     let unkey = unkey::Client::new(&config.unkey_root_key, &config.unkey_api_id);
     let email = EmailSender::new(config.resend_api_key.clone(), config.smtp_url.clone())?;
 
+    let dns = HickoryDnsResolver::new()?;
+
     let state = AppState {
         database,
         redis,
         unkey,
         email: std::sync::Arc::new(email),
+        dns: std::sync::Arc::new(dns),
     };
 
     // Request ID header name
@@ -77,6 +81,7 @@ async fn main() -> Result<()> {
         .nest("/auth", handlers::auth::router())
         .nest("/devices", handlers::devices::router())
         .nest("/drops", handlers::drops::router())
+        .nest("/workspace", handlers::workspace::router())
         .with_state(state)
         // Request ID: generate UUID, include in logs, return in response
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
