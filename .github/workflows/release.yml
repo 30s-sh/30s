@@ -63,6 +63,8 @@ jobs:
             s3cmd put "$file" "s3://30s-releases/cli/${VERSION}/${filename}" --acl-public
           done
           s3cmd put binaries/checksums.txt "s3://30s-releases/cli/${VERSION}/checksums.txt" --acl-public
-      - run: |
+      - name: Update latest.txt (stable releases only)
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
           echo "${{ github.ref_name }}" > latest.txt
           s3cmd put latest.txt s3://30s-releases/latest.txt --acl-public
