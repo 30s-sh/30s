@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 use axum::{Router, http};
+use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tower_http::{
@@ -23,8 +24,18 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use crate::{config::Config, dns::HickoryDnsResolver, email::EmailSender, state::AppState};
 
+#[derive(Parser)]
+#[command(name = "api")]
+#[command(about = "30s API server")]
+struct Args {
+    /// Run database migrations and exit
+    #[arg(long)]
+    migrate: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     let config = envy::prefixed("THIRTY_SECS_").from_env::<Config>()?;
 
     // Initialize Sentry for error tracking (must be done early, guard must stay alive)
@@ -57,7 +68,14 @@ async fn main() -> Result<()> {
         .max_connections(25)
         .connect(&config.database_url)
         .await?;
-    sqlx::migrate!("./migrations").run(&database).await?;
+
+    // Run migrations via init container only (--migrate flag)
+    if args.migrate {
+        tracing::info!("Running database migrations...");
+        sqlx::migrate!("./migrations").run(&database).await?;
+        tracing::info!("Migrations complete");
+        return Ok(());
+    }
 
     let redis = redis::Client::open(config.redis_url.as_str())?;
     let unkey = unkey::Client::new(&config.unkey_root_key, &config.unkey_api_id);
