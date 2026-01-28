@@ -14,8 +14,14 @@
 //! ```text
 //! drop:{uuid} → StoredDrop JSON (auto-expires via TTL)
 //! inbox:{user_id} → sorted set of drop IDs (score = expiration timestamp)
-//! ratelimit:drops:{user_id}:{YYYY-MM} → monthly drop count (auto-expires)
+//! ratelimit:drops:{user_id}:{YYYY-MM} → monthly drop count (free tier, auto-expires)
+//! ratelimit:drops:external:{user_id}:{YYYY-MM} → monthly external drop count (paid tier, auto-expires)
 //! ```
+//!
+//! ## Rate Limiting
+//!
+//! - **Free tier**: 50 sends/month total
+//! - **Paid workspace**: Unlimited internal sends, 50/month external sends
 //!
 //! ## Endpoints
 //!
@@ -40,7 +46,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     middleware::auth::AuthUser,
-    models::{StoredDrop, User},
+    models::{StoredDrop, User, Workspace},
     state::AppState,
 };
 
@@ -51,24 +57,18 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_drop).delete(delete_drop))
 }
 
-#[debug_handler]
-async fn create_drop(
-    user: AuthUser,
-    State(state): State<AppState>,
-    Json(payload): Json<CreateDropPayload>,
-) -> Result<impl IntoResponse, AppError> {
-    payload
-        .validate_with(&Utc::now())
-        .map_err(|e| AppError::Validation(e.to_string()))?;
-
-    // Rate limit: 50 drops per month per user
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let now = Utc::now();
-    let ratelimit_key = format!("ratelimit:drops:{}:{}", user.id, now.format("%Y-%m"));
-
+/// Check and increment a rate limit counter.
+/// Returns an error if the limit is exceeded.
+async fn check_rate_limit(
+    redis: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    limit: i64,
+    error_msg: &'static str,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
     let count: i64 = redis::cmd("INCR")
-        .arg(&ratelimit_key)
-        .query_async(&mut redis)
+        .arg(key)
+        .query_async(redis)
         .await?;
 
     if count == 1 {
@@ -81,32 +81,118 @@ async fn create_drop(
         let ttl = (next_month - now).num_seconds();
 
         let _: () = redis::cmd("EXPIRE")
-            .arg(&ratelimit_key)
+            .arg(key)
             .arg(ttl)
-            .query_async(&mut redis)
+            .query_async(redis)
             .await?;
     }
 
-    if count > 50 {
+    if count > limit {
         return Err(AppError::External(
             StatusCode::TOO_MANY_REQUESTS,
-            "Monthly limit exceeded (50 drops/month)",
+            error_msg,
         ));
     }
 
-    // Get sender's email for metadata
+    Ok(())
+}
+
+#[debug_handler]
+async fn create_drop(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(payload): Json<CreateDropPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    payload
+        .validate_with(&Utc::now())
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    let mut redis = state.redis.get_multiplexed_async_connection().await?;
+    let now = Utc::now();
+
+    // Get sender's email for metadata and rate limiting
     let sender = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
         .fetch_one(&state.database)
         .await?;
 
-    // Verify all recipients exist and are verified, and collect their user IDs.
-    // This catches typos early and prevents sending secrets to non-existent users.
+    // Extract sender's email domain
+    let sender_domain = sender
+        .email
+        .split('@')
+        .nth(1)
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Invalid sender email format")))?
+        .to_string();
+
+    // Check if sender belongs to a paid workspace
+    let paid_workspace = sqlx::query_as!(
+        Workspace,
+        r#"
+        SELECT w.*
+        FROM workspaces w
+        JOIN workspace_domains wd ON wd.workspace_id = w.id
+        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
+        AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
+        "#,
+        &sender_domain
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    // Collect recipient emails
     let recipient_emails: Vec<String> = payload
         .wrapped_keys
         .iter()
         .map(|wk| wk.recipient_email.clone())
         .collect();
 
+    if let Some(workspace) = paid_workspace {
+        // Paid workspace: unlimited internal, 50/month external
+        // Get all verified domains for this workspace
+        let workspace_domains: Vec<String> = sqlx::query_scalar!(
+            r#"
+            SELECT domain FROM workspace_domains
+            WHERE workspace_id = $1 AND verified_at IS NOT NULL
+            "#,
+            workspace.id
+        )
+        .fetch_all(&state.database)
+        .await?;
+
+        // Count external recipients (domains not in workspace)
+        let external_count = recipient_emails
+            .iter()
+            .filter(|email| {
+                let recipient_domain = email.split('@').nth(1).unwrap_or("");
+                !workspace_domains.iter().any(|d| d == recipient_domain)
+            })
+            .count();
+
+        if external_count > 0 {
+            // Apply external rate limit
+            check_rate_limit(
+                &mut redis,
+                &format!("ratelimit:drops:external:{}:{}", user.id, now.format("%Y-%m")),
+                50,
+                "Monthly external recipient limit exceeded (50/month). Internal sends are unlimited.",
+                now,
+            )
+            .await?;
+        }
+        // If all recipients are internal, no rate limit applies
+    } else {
+        // Free tier: 50 sends/month total
+        check_rate_limit(
+            &mut redis,
+            &format!("ratelimit:drops:{}:{}", user.id, now.format("%Y-%m")),
+            50,
+            "Monthly limit exceeded (50 drops/month)",
+            now,
+        )
+        .await?;
+    }
+
+    // Verify all recipients exist and are verified, and collect their user IDs.
+    // This catches typos early and prevents sending secrets to non-existent users.
     let mut recipient_user_ids: Vec<Uuid> = Vec::with_capacity(recipient_emails.len());
     for email in &recipient_emails {
         let recipient = sqlx::query_as!(

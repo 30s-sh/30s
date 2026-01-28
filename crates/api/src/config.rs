@@ -20,6 +20,12 @@ pub struct Config {
     /// Sentry DSN for error tracking (Better Stack compatible)
     #[serde(default)]
     pub sentry_dsn: Option<String>,
+    /// Stripe secret key (sk_test_... or sk_live_...)
+    pub stripe_secret_key: String,
+    /// Stripe webhook signing secret (whsec_...)
+    pub stripe_webhook_secret: String,
+    /// Stripe Price ID for workspace subscription (price_...)
+    pub stripe_price_id: String,
 }
 
 impl Config {

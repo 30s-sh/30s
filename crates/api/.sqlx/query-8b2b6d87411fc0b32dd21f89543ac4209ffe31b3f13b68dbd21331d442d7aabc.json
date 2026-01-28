@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE workspaces\n        SET stripe_subscription_id = $1, subscription_status = 'active'\n        WHERE id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b2b6d87411fc0b32dd21f89543ac4209ffe31b3f13b68dbd21331d442d7aabc"
+}

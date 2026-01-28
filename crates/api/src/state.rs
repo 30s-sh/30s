@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sqlx::{Pool, Postgres};
+use stripe::Client as StripeClient;
 
 use crate::{dns::DnsResolver, email::EmailSender, unkey};
 
@@ -11,4 +12,7 @@ pub struct AppState {
     pub unkey: unkey::Client,
     pub email: Arc<EmailSender>,
     pub dns: Arc<dyn DnsResolver>,
+    pub stripe: StripeClient,
+    pub stripe_webhook_secret: String,
+    pub stripe_price_id: String,
 }

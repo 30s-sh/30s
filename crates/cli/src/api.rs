@@ -3,8 +3,9 @@
 use anyhow::Result;
 use reqwest::{Client, Response};
 use shared::api::{
-    AddDomainPayload, AddDomainResponse, CreateDropPayload, CreateDropResponse, DeviceInfo,
-    DevicePublicKey, DomainInfo, Drop, GetPublicKeysPayload, InboxItem, MeResponse,
+    AddDomainPayload, AddDomainResponse, BillingStatus, CreateCheckoutSessionResponse,
+    CreateDropPayload, CreateDropResponse, CreatePortalSessionResponse, CreateWorkspacePayload,
+    DeviceInfo, DevicePublicKey, DomainInfo, Drop, GetPublicKeysPayload, InboxItem, MeResponse,
     RegisterDevicePayload, RequestCodePayload, RotateVerifyPayload, RotateVerifyResponse,
     VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse, WorkspaceInfo,
 };
@@ -300,6 +301,65 @@ impl Api {
         let response = Self::check_response(
             self.http
                 .get(format!("{}/workspace/domains", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Creates a new workspace.
+    pub async fn create_workspace(&self, key: String, name: &str) -> Result<WorkspaceInfo> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/workspace", self.base_url))
+                .bearer_auth(key)
+                .json(&CreateWorkspacePayload {
+                    name: name.to_string(),
+                })
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Creates a Stripe Checkout session for subscription.
+    pub async fn create_checkout(&self, key: String) -> Result<CreateCheckoutSessionResponse> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/billing/checkout", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Creates a Stripe Customer Portal session.
+    pub async fn create_portal(&self, key: String) -> Result<CreatePortalSessionResponse> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/billing/portal", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Gets billing status for the user's workspace.
+    pub async fn billing_status(&self, key: String) -> Result<BillingStatus> {
+        let response = Self::check_response(
+            self.http
+                .get(format!("{}/billing/status", self.base_url))
                 .bearer_auth(key)
                 .send()
                 .await?,

@@ -17,6 +17,21 @@
         "ordinal": 2,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "stripe_customer_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "stripe_subscription_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "subscription_status",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -27,6 +42,9 @@
     "nullable": [
       false,
       false,
+      false,
+      true,
+      true,
       false
     ]
   },

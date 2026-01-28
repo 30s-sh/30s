@@ -8,8 +8,10 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use garde::Validate;
 use shared::api::{
-    AddDomainPayload, AddDomainResponse, DomainInfo, VerifyDomainResponse, WorkspaceInfo,
+    AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo, VerifyDomainResponse,
+    WorkspaceInfo,
 };
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
@@ -28,7 +30,7 @@ const VERIFY_PREFIX: &str = "30s-verify=";
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(get_workspace))
+        .route("/", get(get_workspace).post(create_workspace))
         .route("/domains", get(list_domains).post(add_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
 }
@@ -59,19 +61,47 @@ fn txt_record_value(token: &str) -> String {
     format!("{}{}", VERIFY_PREFIX, token)
 }
 
-/// Get the user's workspace (if they belong to one via email domain).
+/// Get the user's workspace (if they belong to one via email domain or are admin).
 #[debug_handler]
 async fn get_workspace(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
+    // First check if user is an admin of any workspace
+    let admin_workspace = sqlx::query_as!(
+        WorkspaceAdmin,
+        "SELECT * FROM workspace_admins WHERE user_id = $1",
+        user.id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    if let Some(admin) = admin_workspace {
+        let workspace = sqlx::query_as!(
+            Workspace,
+            "SELECT * FROM workspaces WHERE id = $1",
+            admin.workspace_id
+        )
+        .fetch_one(&state.database)
+        .await?;
+
+        let is_paid = workspace.has_active_subscription();
+        return Ok(Json(WorkspaceInfo {
+            id: workspace.id,
+            name: workspace.name,
+            created_at: workspace.created_at,
+            subscription_status: workspace.subscription_status,
+            is_paid,
+        }));
+    }
+
+    // Otherwise, find a verified domain that matches the user's email domain
     let email_domain = get_user_email_domain(&state.database, user.id).await?;
 
-    // Find a verified domain that matches the user's email domain
     let workspace = sqlx::query_as!(
         Workspace,
         r#"
-        SELECT w.id, w.name, w.created_at
+        SELECT w.*
         FROM workspaces w
         JOIN workspace_domains wd ON wd.workspace_id = w.id
         WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
@@ -82,11 +112,16 @@ async fn get_workspace(
     .await?;
 
     match workspace {
-        Some(w) => Ok(Json(WorkspaceInfo {
-            id: w.id,
-            name: w.name,
-            created_at: w.created_at,
-        })),
+        Some(w) => {
+            let is_paid = w.has_active_subscription();
+            Ok(Json(WorkspaceInfo {
+                id: w.id,
+                name: w.name,
+                created_at: w.created_at,
+                subscription_status: w.subscription_status,
+                is_paid,
+            }))
+        }
         None => Err(AppError::External(
             StatusCode::NOT_FOUND,
             "No workspace found for your email domain",
@@ -94,7 +129,75 @@ async fn get_workspace(
     }
 }
 
-/// Add a domain for verification. User's email must match the domain.
+/// Create a new workspace. The user becomes an admin.
+#[debug_handler]
+async fn create_workspace(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(payload): Json<CreateWorkspacePayload>,
+) -> Result<impl IntoResponse, AppError> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Check if user is already an admin of a workspace
+    let existing_admin = sqlx::query_as!(
+        WorkspaceAdmin,
+        "SELECT * FROM workspace_admins WHERE user_id = $1",
+        user.id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    if existing_admin.is_some() {
+        return Err(AppError::External(
+            StatusCode::CONFLICT,
+            "You are already an admin of a workspace",
+        ));
+    }
+
+    // Create workspace and add user as admin in a transaction
+    let mut tx = state.database.begin().await?;
+
+    let workspace = sqlx::query_as!(
+        Workspace,
+        "INSERT INTO workspaces (name) VALUES ($1) RETURNING *",
+        payload.name
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        "INSERT INTO workspace_admins (workspace_id, user_id) VALUES ($1, $2)",
+        workspace.id,
+        user.id
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        workspace_id = %workspace.id,
+        user_id = %user.id,
+        name = %workspace.name,
+        "workspace created"
+    );
+
+    let is_paid = workspace.has_active_subscription();
+    Ok((
+        StatusCode::CREATED,
+        Json(WorkspaceInfo {
+            id: workspace.id,
+            name: workspace.name,
+            created_at: workspace.created_at,
+            subscription_status: workspace.subscription_status,
+            is_paid,
+        }),
+    ))
+}
+
+/// Add a domain for verification. User must be workspace admin.
 #[debug_handler]
 async fn add_domain(
     user: AuthUser,
@@ -108,14 +211,33 @@ async fn add_domain(
         return Err(AppError::Validation("Invalid domain format".to_string()));
     }
 
-    // Verify user's email matches the domain they're trying to verify
+    // Verify user's email matches the domain they're trying to add
     let email_domain = get_user_email_domain(&state.database, user.id).await?;
     if email_domain != domain {
         return Err(AppError::External(
             StatusCode::FORBIDDEN,
-            "Your email domain must match the domain you're verifying",
+            "Your email domain must match the domain you're adding",
         ));
     }
+
+    // Check if user is an admin of a workspace
+    let admin = sqlx::query_as!(
+        WorkspaceAdmin,
+        "SELECT * FROM workspace_admins WHERE user_id = $1",
+        user.id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    let workspace_id = match admin {
+        Some(a) => a.workspace_id,
+        None => {
+            return Err(AppError::External(
+                StatusCode::FORBIDDEN,
+                "You must create a workspace first: 30s workspace create <name>",
+            ));
+        }
+    };
 
     // Check if domain already exists
     let existing = sqlx::query_as!(
@@ -133,8 +255,7 @@ async fn add_domain(
                 "Domain is already verified",
             ));
         }
-        // Domain exists but not verified - could return existing token or regenerate
-        // For simplicity, we'll return an error asking them to verify the existing one
+        // Domain exists but not verified
         return Err(AppError::External(
             StatusCode::CONFLICT,
             "Domain verification already pending",
@@ -145,18 +266,17 @@ async fn add_domain(
     let token_bytes: [u8; 16] = rand::random();
     let token = hex::encode(token_bytes);
 
-    // Insert the domain (no workspace_id yet - will be set on verification)
-    sqlx::query_as!(
-        WorkspaceDomain,
+    // Insert the domain linked to the workspace
+    sqlx::query!(
         r#"
-        INSERT INTO workspace_domains (domain, verification_token)
-        VALUES ($1, $2)
-        RETURNING *
+        INSERT INTO workspace_domains (workspace_id, domain, verification_token)
+        VALUES ($1, $2, $3)
         "#,
+        workspace_id,
         domain,
         token
     )
-    .fetch_one(&state.database)
+    .execute(&state.database)
     .await?;
 
     let txt_host = txt_record_host(&domain);
@@ -173,6 +293,7 @@ async fn add_domain(
 }
 
 /// Verify a domain via DNS TXT record lookup.
+/// Requires an active subscription.
 #[debug_handler]
 async fn verify_domain(
     user: AuthUser,
@@ -204,7 +325,7 @@ async fn verify_domain(
         None => {
             return Err(AppError::External(
                 StatusCode::NOT_FOUND,
-                "No pending verification for this domain",
+                "No pending verification for this domain. Add it first: 30s workspace domain add",
             ))
         }
     };
@@ -213,6 +334,27 @@ async fn verify_domain(
         return Err(AppError::External(
             StatusCode::CONFLICT,
             "Domain is already verified",
+        ));
+    }
+
+    // Get the workspace and check subscription status
+    let workspace_id = pending.workspace_id.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!("Domain not linked to a workspace"))
+    })?;
+
+    let workspace = sqlx::query_as!(
+        Workspace,
+        "SELECT * FROM workspaces WHERE id = $1",
+        workspace_id
+    )
+    .fetch_one(&state.database)
+    .await?;
+
+    // Check if workspace has active subscription
+    if !workspace.has_active_subscription() {
+        return Err(AppError::External(
+            StatusCode::PAYMENT_REQUIRED,
+            "Active subscription required to verify domains. Run: 30s billing subscribe",
         ));
     }
 
@@ -247,61 +389,24 @@ async fn verify_domain(
         ));
     }
 
-    // Check if there's already a workspace for this domain (shouldn't happen, but be safe)
-    let (workspace_id, workspace_name, workspace_created) = if let Some(ws_id) = pending.workspace_id
-    {
-        // Workspace already exists (edge case)
-        let ws = sqlx::query_as!(Workspace, "SELECT * FROM workspaces WHERE id = $1", ws_id)
-            .fetch_one(&state.database)
-            .await?;
-        (ws_id, ws.name, false)
-    } else {
-        // Create workspace, link domain, and add admin in a transaction
-        let workspace_name = domain.clone();
-        let mut tx = state.database.begin().await?;
-
-        let ws = sqlx::query_as!(
-            Workspace,
-            "INSERT INTO workspaces (name) VALUES ($1) RETURNING *",
-            workspace_name
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
-        sqlx::query_as!(
-            WorkspaceDomain,
-            "UPDATE workspace_domains SET workspace_id = $1, verified_at = NOW() WHERE domain = $2 RETURNING *",
-            ws.id,
-            domain
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
-        sqlx::query_as!(
-            WorkspaceAdmin,
-            "INSERT INTO workspace_admins (workspace_id, user_id) VALUES ($1, $2) RETURNING *",
-            ws.id,
-            user.id
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        (ws.id, workspace_name, true)
-    };
+    // Mark domain as verified
+    sqlx::query!(
+        "UPDATE workspace_domains SET verified_at = NOW() WHERE domain = $1",
+        domain
+    )
+    .execute(&state.database)
+    .await?;
 
     tracing::info!(
-        "Domain {} verified for workspace {} (created: {})",
+        "Domain {} verified for workspace {}",
         domain,
-        workspace_id,
-        workspace_created
+        workspace_id
     );
 
     Ok(Json(VerifyDomainResponse {
         domain,
-        workspace_name,
-        workspace_created,
+        workspace_name: workspace.name,
+        workspace_created: false,
     }))
 }
 
