@@ -12,6 +12,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crypto_box::{PublicKey, SecretKey};
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
+use zeroize::Zeroize;
 
 use crate::{api::Api, config::Config, credentials, crypto, known_keys, ui};
 
@@ -22,11 +23,12 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
     let api_key = credentials::get_api_key().await?;
 
     let private_key_b64 = credentials::get_private_key().await?;
-    let private_key_bytes = BASE64.decode(private_key_b64)?;
+    let mut private_key_bytes = BASE64.decode(private_key_b64)?;
     let recipient_secret_key = SecretKey::from(
         <[u8; 32]>::try_from(private_key_bytes.as_slice())
             .map_err(|_| anyhow!("Invalid private key length"))?,
     );
+    private_key_bytes.zeroize();
 
     // Fetch the drop
     let drop = ui::spin("Fetching drop...", api.get_drop(api_key, &drop_id)).await?;
