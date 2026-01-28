@@ -13,7 +13,7 @@ resources:
 images:
   - name: 30s-api
     newName: ghcr.io/30s-sh/30s-api
-    newTag: v0.2.0
+    newTag: v0.3.0
 
 patches:
   - patch: |-

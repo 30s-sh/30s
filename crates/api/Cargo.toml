@@ -1,6 +1,6 @@
 [package]
 name = "api"
-version = "0.3.0-rc3"
+version = "0.3.0"
 edition.workspace = true
 
 [dependencies]
@@ -42,7 +42,11 @@ tower-http = { version = "0.6.8", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
 reqwest = { version = "0.13.1", features = ["json"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 resend-rs = "0.20.0"
