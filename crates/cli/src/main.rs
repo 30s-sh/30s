@@ -146,12 +146,23 @@ enum Commands {
     /// Manage your workspace and domain verification
     #[command(after_help = "Examples:
   30s workspace                           Show workspace status
+  30s workspace create 'Acme Corp'        Create a new workspace
   30s workspace domain add acme.com       Start domain verification
   30s workspace domain verify acme.com    Complete verification
   30s workspace domains                   List all domains")]
     Workspace {
         #[command(subcommand)]
         action: Option<WorkspaceCommands>,
+    },
+
+    /// Manage billing and subscription
+    #[command(after_help = "Examples:
+  30s billing                             Show billing status
+  30s billing subscribe                   Subscribe to paid plan
+  30s billing manage                      Open Stripe portal")]
+    Billing {
+        #[command(subcommand)]
+        action: Option<BillingCommands>,
     },
 
     /// Generate shell completions
@@ -207,6 +218,12 @@ enum RotateCommands {
 
 #[derive(Subcommand)]
 enum WorkspaceCommands {
+    /// Create a new workspace
+    #[command(after_help = "Example: 30s workspace create 'Acme Corp'")]
+    Create {
+        /// Name for the workspace
+        name: String,
+    },
     /// Add a domain for verification
     #[command(after_help = "Example: 30s workspace domain add acme.com")]
     Domain {
@@ -216,6 +233,16 @@ enum WorkspaceCommands {
     /// List all domains for your workspace
     #[command(after_help = "Example: 30s workspace domains")]
     Domains,
+}
+
+#[derive(Subcommand)]
+enum BillingCommands {
+    /// Subscribe to a paid workspace plan
+    #[command(after_help = "Example: 30s billing subscribe")]
+    Subscribe,
+    /// Open Stripe Customer Portal to manage subscription
+    #[command(after_help = "Example: 30s billing manage")]
+    Manage,
 }
 
 #[derive(Subcommand)]
@@ -305,6 +332,9 @@ async fn run() -> anyhow::Result<()> {
             RotateCommands::Keys => commands::rotate::keys(&config).await,
         },
         Commands::Workspace { action } => match action {
+            Some(WorkspaceCommands::Create { name }) => {
+                commands::workspace::create(&config, &name).await
+            }
             Some(WorkspaceCommands::Domain { action }) => match action {
                 DomainCommands::Add { domain } => {
                     commands::workspace::add_domain(&config, &domain).await
@@ -315,6 +345,11 @@ async fn run() -> anyhow::Result<()> {
             },
             Some(WorkspaceCommands::Domains) => commands::workspace::list_domains(&config).await,
             None => commands::workspace::status(&config).await,
+        },
+        Commands::Billing { action } => match action {
+            Some(BillingCommands::Subscribe) => commands::billing::subscribe(&config).await,
+            Some(BillingCommands::Manage) => commands::billing::manage(&config).await,
+            None => commands::billing::status(&config).await,
         },
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "30s", &mut std::io::stdout());

@@ -9,6 +9,7 @@
     pkgs.git
     pkgs.just
     pkgs.sqlx-cli
+    pkgs.stripe-cli
   ];
 
   languages = {

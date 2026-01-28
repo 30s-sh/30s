@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM workspaces WHERE id = $1",
+  "query": "\n        SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status\n        FROM workspaces WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "b702c1ee31be8aeede43e3d35092652c74ece781fe2f66e082573c8d51f1e9db"
+  "hash": "dce0ebab2d7b2af70d391cca360df63fb6be909df726783f65da92ad4697a5d5"
 }

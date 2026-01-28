@@ -11,16 +11,24 @@ pub async fn status(config: &Config) -> Result<()> {
 
     match api.get_workspace(api_key).await {
         Ok(workspace) => {
-            println!("Workspace: {}", workspace.name);
-            println!("Created:   {}", workspace.created_at.format("%Y-%m-%d"));
+            println!("Workspace:    {}", workspace.name);
+            println!("Created:      {}", workspace.created_at.format("%Y-%m-%d"));
+            println!("Subscription: {}", format_status(&workspace.subscription_status));
+            if workspace.is_paid {
+                println!("Benefits:     Unlimited internal sends, 50/month external");
+            } else {
+                println!();
+                println!("Upgrade for unlimited internal sends:");
+                println!("  30s billing subscribe");
+            }
         }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("No workspace found") {
                 println!("No workspace found for your email domain.");
                 println!();
-                println!("To create a workspace, verify your domain:");
-                println!("  30s workspace domain add yourdomain.com");
+                println!("Create a workspace:");
+                println!("  30s workspace create <name>");
             } else {
                 return Err(e);
             }
@@ -28,6 +36,34 @@ pub async fn status(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create a new workspace.
+pub async fn create(config: &Config, name: &str) -> Result<()> {
+    let api_key = credentials::get_api_key().await?;
+    let api = Api::new(config.api_url.clone());
+
+    let workspace = api.create_workspace(api_key, name).await?;
+
+    ui::success(&format!("Workspace '{}' created!", workspace.name));
+    println!();
+    println!("Next steps:");
+    println!("  1. Subscribe:     30s billing subscribe");
+    println!("  2. Add domain:    30s workspace domain add yourdomain.com");
+    println!("  3. Verify domain: 30s workspace domain verify yourdomain.com");
+
+    Ok(())
+}
+
+fn format_status(status: &str) -> &str {
+    match status {
+        "active" => "Active",
+        "past_due" => "Past Due (please update payment method)",
+        "canceled" => "Canceled",
+        "unpaid" => "Unpaid",
+        "none" => "Free tier",
+        _ => status,
+    }
 }
 
 /// Add a domain for verification.

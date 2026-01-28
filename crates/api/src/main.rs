@@ -65,12 +65,17 @@ async fn main() -> Result<()> {
 
     let dns = HickoryDnsResolver::new()?;
 
+    let stripe = stripe::Client::new(&config.stripe_secret_key);
+
     let state = AppState {
         database,
         redis,
         unkey,
         email: std::sync::Arc::new(email),
         dns: std::sync::Arc::new(dns),
+        stripe,
+        stripe_webhook_secret: config.stripe_webhook_secret.clone(),
+        stripe_price_id: config.stripe_price_id.clone(),
     };
 
     // Request ID header name
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .nest("/health", handlers::health::router())
         .nest("/auth", handlers::auth::router())
+        .nest("/billing", handlers::billing::router())
         .nest("/devices", handlers::devices::router())
         .nest("/drops", handlers::drops::router())
         .nest("/workspace", handlers::workspace::router())

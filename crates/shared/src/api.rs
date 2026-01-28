@@ -214,7 +214,6 @@ pub struct DomainInfo {
 
 /// Information about a workspace.
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "sqlx", derive(sqlx::FromRow))]
 pub struct WorkspaceInfo {
     /// Workspace ID.
     pub id: uuid::Uuid,
@@ -222,6 +221,44 @@ pub struct WorkspaceInfo {
     pub name: String,
     /// When the workspace was created.
     pub created_at: DateTime<Utc>,
+    /// Subscription status: none, active, past_due, canceled, unpaid.
+    pub subscription_status: String,
+    /// Whether the workspace has an active subscription.
+    pub is_paid: bool,
+}
+
+// ============================================================================
+// Billing types
+// ============================================================================
+
+/// Request to create a workspace.
+#[derive(Debug, Serialize, Deserialize, Validate)]
+pub struct CreateWorkspacePayload {
+    #[garde(length(min = 1, max = 100))]
+    pub name: String,
+}
+
+/// Response after creating a Stripe Checkout session.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateCheckoutSessionResponse {
+    /// URL to redirect the user to Stripe Checkout.
+    pub checkout_url: String,
+}
+
+/// Response after creating a Stripe Customer Portal session.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatePortalSessionResponse {
+    /// URL to redirect the user to Stripe Customer Portal.
+    pub portal_url: String,
+}
+
+/// Billing status for a workspace.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BillingStatus {
+    /// Subscription status: none, active, past_due, canceled, unpaid.
+    pub subscription_status: String,
+    /// Whether the workspace has an active subscription.
+    pub is_paid: bool,
 }
 
 #[cfg(test)]

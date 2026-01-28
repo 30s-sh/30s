@@ -26,6 +26,16 @@ pub struct Workspace {
     pub id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    pub stripe_customer_id: Option<String>,
+    pub stripe_subscription_id: Option<String>,
+    pub subscription_status: String,
+}
+
+impl Workspace {
+    /// Returns true if the workspace has an active subscription (active or past_due).
+    pub fn has_active_subscription(&self) -> bool {
+        matches!(self.subscription_status.as_str(), "active" | "past_due")
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

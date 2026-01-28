@@ -1,4 +1,5 @@
 pub mod alias;
+pub mod billing;
 pub mod delete;
 pub mod destroy;
 pub mod devices;

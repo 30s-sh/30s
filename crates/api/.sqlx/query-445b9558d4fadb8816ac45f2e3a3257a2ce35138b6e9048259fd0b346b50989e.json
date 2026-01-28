@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE workspaces\n        SET stripe_subscription_id = $1, subscription_status = $2\n        WHERE stripe_customer_id = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "445b9558d4fadb8816ac45f2e3a3257a2ce35138b6e9048259fd0b346b50989e"
+}
