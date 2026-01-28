@@ -21,6 +21,30 @@ pub struct Device {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkspaceDomain {
+    pub id: Uuid,
+    pub workspace_id: Option<Uuid>,
+    pub domain: String,
+    pub verification_token: String,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkspaceAdmin {
+    pub workspace_id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Drop stored in Redis with automatic expiration via TTL.
 ///
 /// Drops are ephemeral encrypted secrets. The server only stores ciphertext and

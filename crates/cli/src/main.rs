@@ -143,6 +143,17 @@ enum Commands {
         action: RotateCommands,
     },
 
+    /// Manage your workspace and domain verification
+    #[command(after_help = "Examples:
+  30s workspace                           Show workspace status
+  30s workspace domain add acme.com       Start domain verification
+  30s workspace domain verify acme.com    Complete verification
+  30s workspace domains                   List all domains")]
+    Workspace {
+        #[command(subcommand)]
+        action: Option<WorkspaceCommands>,
+    },
+
     /// Generate shell completions
     #[command(after_help = "Examples:
   30s completions bash > ~/.bash_completion.d/30s
@@ -192,6 +203,35 @@ enum RotateCommands {
     /// Rotate your device encryption keys (inbox must be empty)
     #[command(after_help = "Example: 30s rotate keys")]
     Keys,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// Add a domain for verification
+    #[command(after_help = "Example: 30s workspace domain add acme.com")]
+    Domain {
+        #[command(subcommand)]
+        action: DomainCommands,
+    },
+    /// List all domains for your workspace
+    #[command(after_help = "Example: 30s workspace domains")]
+    Domains,
+}
+
+#[derive(Subcommand)]
+enum DomainCommands {
+    /// Add a domain to verify
+    #[command(after_help = "Example: 30s workspace domain add acme.com")]
+    Add {
+        /// Domain to verify (must match your email domain)
+        domain: String,
+    },
+    /// Verify a domain via DNS TXT record
+    #[command(after_help = "Example: 30s workspace domain verify acme.com")]
+    Verify {
+        /// Domain to verify
+        domain: String,
+    },
 }
 
 #[tokio::main]
@@ -263,6 +303,18 @@ async fn run() -> anyhow::Result<()> {
         Commands::Rotate { action } => match action {
             RotateCommands::Auth => commands::rotate::auth(&config).await,
             RotateCommands::Keys => commands::rotate::keys(&config).await,
+        },
+        Commands::Workspace { action } => match action {
+            Some(WorkspaceCommands::Domain { action }) => match action {
+                DomainCommands::Add { domain } => {
+                    commands::workspace::add_domain(&config, &domain).await
+                }
+                DomainCommands::Verify { domain } => {
+                    commands::workspace::verify_domain(&config, &domain).await
+                }
+            },
+            Some(WorkspaceCommands::Domains) => commands::workspace::list_domains(&config).await,
+            None => commands::workspace::status(&config).await,
         },
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "30s", &mut std::io::stdout());

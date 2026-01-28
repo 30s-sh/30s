@@ -3,9 +3,10 @@
 use anyhow::Result;
 use reqwest::{Client, Response};
 use shared::api::{
-    CreateDropPayload, CreateDropResponse, DeviceInfo, DevicePublicKey, Drop, GetPublicKeysPayload,
-    InboxItem, MeResponse, RegisterDevicePayload, RequestCodePayload, RotateVerifyPayload,
-    RotateVerifyResponse, VerifyCodePayload, VerifyCodeResponse,
+    AddDomainPayload, AddDomainResponse, CreateDropPayload, CreateDropResponse, DeviceInfo,
+    DevicePublicKey, DomainInfo, Drop, GetPublicKeysPayload, InboxItem, MeResponse,
+    RegisterDevicePayload, RequestCodePayload, RotateVerifyPayload, RotateVerifyResponse,
+    VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse, WorkspaceInfo,
 };
 
 pub struct Api {
@@ -241,6 +242,65 @@ impl Api {
                 .post(format!("{}/auth/rotate/verify", self.base_url))
                 .bearer_auth(key)
                 .json(&RotateVerifyPayload { code })
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Gets the user's workspace information.
+    pub async fn get_workspace(&self, key: String) -> Result<WorkspaceInfo> {
+        let response = Self::check_response(
+            self.http
+                .get(format!("{}/workspace", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Adds a domain for verification.
+    pub async fn add_domain(&self, key: String, domain: &str) -> Result<AddDomainResponse> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/workspace/domains", self.base_url))
+                .bearer_auth(key)
+                .json(&AddDomainPayload {
+                    domain: domain.to_string(),
+                })
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Verifies a domain via DNS TXT record.
+    pub async fn verify_domain(&self, key: String, domain: &str) -> Result<VerifyDomainResponse> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/workspace/domains/{}/verify", self.base_url, domain))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Lists domains for the user's workspace.
+    pub async fn list_domains(&self, key: String) -> Result<Vec<DomainInfo>> {
+        let response = Self::check_response(
+            self.http
+                .get(format!("{}/workspace/domains", self.base_url))
+                .bearer_auth(key)
                 .send()
                 .await?,
         )

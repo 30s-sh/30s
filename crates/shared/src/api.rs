@@ -168,6 +168,62 @@ pub struct RotateVerifyResponse {
     pub api_key: String,
 }
 
+// ============================================================================
+// Workspace types
+// ============================================================================
+
+/// Request to add a domain for verification.
+#[derive(Debug, Serialize, Deserialize, Validate)]
+pub struct AddDomainPayload {
+    #[garde(length(min = 1, max = 253))]
+    pub domain: String,
+}
+
+/// Response after adding a domain, contains verification instructions.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddDomainResponse {
+    /// The domain being verified (normalized to lowercase).
+    pub domain: String,
+    /// The DNS TXT record host (e.g., "_30s.acme.com").
+    pub txt_host: String,
+    /// The DNS TXT record value (e.g., "30s-verify=abc123...").
+    pub txt_value: String,
+}
+
+/// Response after successfully verifying a domain.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerifyDomainResponse {
+    /// The domain that was verified.
+    pub domain: String,
+    /// The workspace name.
+    pub workspace_name: String,
+    /// Whether a new workspace was created (true) or domain added to existing (false).
+    pub workspace_created: bool,
+}
+
+/// Information about a verified domain.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DomainInfo {
+    /// The domain name.
+    pub domain: String,
+    /// Whether the domain has been verified.
+    pub verified: bool,
+    /// When the domain was added.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Information about a workspace.
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::FromRow))]
+pub struct WorkspaceInfo {
+    /// Workspace ID.
+    pub id: uuid::Uuid,
+    /// Workspace name (usually the primary domain).
+    pub name: String,
+    /// When the workspace was created.
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
