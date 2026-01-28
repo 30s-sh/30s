@@ -16,6 +16,18 @@ spec:
     spec:
       imagePullSecrets:
         - name: ghcr-secret
+      initContainers:
+        - name: migrate
+          image: 30s-api:latest
+          command: ["/app/api", "--migrate"]
+          envFrom:
+            - secretRef:
+                name: api-secrets
+          env:
+            - name: THIRTY_SECS_HOST
+              value: "0.0.0.0"
+            - name: THIRTY_SECS_PORT
+              value: "8080"
       containers:
         - name: api
           image: 30s-api:latest
