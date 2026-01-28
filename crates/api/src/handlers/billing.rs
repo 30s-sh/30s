@@ -44,7 +44,11 @@ const WEBHOOK_TOLERANCE_SECS: i64 = 300;
 
 /// Verify Stripe webhook signature using HMAC-SHA256.
 /// Signature header format: t=<timestamp>,v1=<sig1>,v1=<sig2>,...
-fn verify_stripe_signature(payload: &str, signature_header: &str, secret: &str) -> Result<(), &'static str> {
+fn verify_stripe_signature(
+    payload: &str,
+    signature_header: &str,
+    secret: &str,
+) -> Result<(), &'static str> {
     // Parse signature header
     let mut timestamp = None;
     let mut signatures = Vec::new();
@@ -75,8 +79,8 @@ fn verify_stripe_signature(payload: &str, signature_header: &str, secret: &str) 
 
     // Compute expected signature: HMAC-SHA256(secret, "{timestamp}.{payload}")
     let signed_payload = format!("{}.{}", timestamp_str, payload);
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|_| "Invalid webhook secret")?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| "Invalid webhook secret")?;
     mac.update(signed_payload.as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
 
@@ -89,10 +93,7 @@ fn verify_stripe_signature(payload: &str, signature_header: &str, secret: &str) 
 }
 
 /// Get the workspace the user is an admin of.
-async fn get_admin_workspace(
-    state: &AppState,
-    user_id: uuid::Uuid,
-) -> Result<Workspace, AppError> {
+async fn get_admin_workspace(state: &AppState, user_id: uuid::Uuid) -> Result<Workspace, AppError> {
     let admin = sqlx::query_as!(
         WorkspaceAdmin,
         "SELECT * FROM workspace_admins WHERE user_id = $1",
@@ -141,9 +142,9 @@ async fn create_checkout(
 
     // Get or create Stripe customer
     let customer_id = match workspace.stripe_customer_id {
-        Some(ref id) => id.parse::<CustomerId>().map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("Invalid customer ID: {}", e))
-        })?,
+        Some(ref id) => id
+            .parse::<CustomerId>()
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("Invalid customer ID: {}", e)))?,
         None => {
             // Create a new Stripe customer
             let customer = stripe::Customer::create(
@@ -184,8 +185,8 @@ async fn create_checkout(
                 quantity: Some(1),
                 ..Default::default()
             }]),
-            success_url: Some("https://30s.sh/billing/success?session_id={CHECKOUT_SESSION_ID}"),
-            cancel_url: Some("https://30s.sh/billing/cancel"),
+            success_url: None,
+            cancel_url: None,
             metadata: Some(
                 [("workspace_id".to_string(), workspace.id.to_string())]
                     .into_iter()
@@ -196,9 +197,9 @@ async fn create_checkout(
     )
     .await?;
 
-    let checkout_url = checkout_session.url.ok_or_else(|| {
-        AppError::Internal(anyhow::anyhow!("Checkout session missing URL"))
-    })?;
+    let checkout_url = checkout_session
+        .url
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Checkout session missing URL")))?;
 
     tracing::info!(
         workspace_id = %workspace.id,
@@ -225,9 +226,9 @@ async fn create_portal(
         )
     })?;
 
-    let customer: CustomerId = customer_id.parse().map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("Invalid customer ID: {}", e))
-    })?;
+    let customer: CustomerId = customer_id
+        .parse()
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Invalid customer ID: {}", e)))?;
 
     let portal_session = stripe::BillingPortalSession::create(
         &state.stripe,
@@ -268,9 +269,8 @@ async fn handle_webhook(
             AppError::External(StatusCode::BAD_REQUEST, "Missing stripe-signature header")
         })?;
 
-    let payload = std::str::from_utf8(&body).map_err(|_| {
-        AppError::External(StatusCode::BAD_REQUEST, "Invalid payload encoding")
-    })?;
+    let payload = std::str::from_utf8(&body)
+        .map_err(|_| AppError::External(StatusCode::BAD_REQUEST, "Invalid payload encoding"))?;
 
     // Manually verify Stripe webhook signature (HMAC-SHA256)
     verify_stripe_signature(payload, signature_header, &state.stripe_webhook_secret).map_err(
@@ -379,7 +379,9 @@ async fn handle_checkout_completed(
         .as_ref()
         .and_then(|m| m.get("workspace_id"))
         .ok_or_else(|| {
-            AppError::Internal(anyhow::anyhow!("Checkout session missing workspace_id metadata"))
+            AppError::Internal(anyhow::anyhow!(
+                "Checkout session missing workspace_id metadata"
+            ))
         })?;
 
     let workspace_id: uuid::Uuid = workspace_id_str.parse().map_err(|e| {
