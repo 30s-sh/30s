@@ -222,7 +222,7 @@ async fn get_inbox(
 async fn get_drop(
     user: AuthUser,
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let recipient = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
         .fetch_one(&state.database)
@@ -270,7 +270,7 @@ async fn get_drop(
             .await?
             {
                 let inbox_key = format!("inbox:{}", recipient_user.id);
-                let _: () = redis.zrem(&inbox_key, &id).await?;
+                let _: () = redis.zrem(&inbox_key, id.to_string()).await?;
             }
         }
 
@@ -298,7 +298,7 @@ async fn get_drop(
 async fn delete_drop(
     user: AuthUser,
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let sender = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
         .fetch_one(&state.database)
@@ -335,7 +335,7 @@ async fn delete_drop(
             .await?
             {
                 let inbox_key = format!("inbox:{}", recipient.id);
-                let _: () = redis.zrem(&inbox_key, &id).await?;
+                let _: () = redis.zrem(&inbox_key, id.to_string()).await?;
             }
         }
 
