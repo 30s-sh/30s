@@ -319,6 +319,48 @@ pub struct UpdatePoliciesPayload {
     pub allow_external: Option<bool>,
 }
 
+// ============================================================================
+// Activity Log types
+// ============================================================================
+
+/// A single activity log entry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivityLogEntry {
+    /// Unique event ID.
+    pub id: uuid::Uuid,
+    /// Event type: drop.sent, drop.opened, drop.deleted, drop.expired, drop.failed.
+    pub event_type: String,
+    /// User who performed the action.
+    pub actor_email: String,
+    /// Drop ID (None for failed events).
+    pub drop_id: Option<uuid::Uuid>,
+    /// Event metadata (recipient_count, reason, etc.).
+    pub metadata: serde_json::Value,
+    /// When the event occurred.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Response from the activity log endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivityLogResponse {
+    /// Activity log entries.
+    pub entries: Vec<ActivityLogEntry>,
+}
+
+/// Query parameters for the activity log endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActivityLogQuery {
+    /// Filter events after this Unix timestamp (seconds since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    /// Filter by event type (e.g., "drop.sent").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    /// Max entries to return (default 50, 0 = unlimited).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

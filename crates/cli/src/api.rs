@@ -3,12 +3,12 @@
 use anyhow::Result;
 use reqwest::{Client, Response};
 use shared::api::{
-    AddDomainPayload, AddDomainResponse, BillingStatus, CreateCheckoutSessionResponse,
-    CreateDropPayload, CreateDropResponse, CreatePortalSessionResponse, CreateWorkspacePayload,
-    DeviceInfo, DevicePublicKey, DomainInfo, Drop, GetPublicKeysPayload, InboxItem, MeResponse,
-    RegisterDevicePayload, RequestCodePayload, RotateVerifyPayload, RotateVerifyResponse,
-    UpdatePoliciesPayload, VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse,
-    WorkspaceInfo, WorkspacePolicies,
+    ActivityLogQuery, ActivityLogResponse, AddDomainPayload, AddDomainResponse, BillingStatus,
+    CreateCheckoutSessionResponse, CreateDropPayload, CreateDropResponse,
+    CreatePortalSessionResponse, CreateWorkspacePayload, DeviceInfo, DevicePublicKey, DomainInfo,
+    Drop, GetPublicKeysPayload, InboxItem, MeResponse, RegisterDevicePayload, RequestCodePayload,
+    RotateVerifyPayload, RotateVerifyResponse, UpdatePoliciesPayload, VerifyCodePayload,
+    VerifyCodeResponse, VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
 };
 
 pub struct Api {
@@ -287,7 +287,10 @@ impl Api {
     pub async fn verify_domain(&self, key: String, domain: &str) -> Result<VerifyDomainResponse> {
         let response = Self::check_response(
             self.http
-                .post(format!("{}/workspace/domains/{}/verify", self.base_url, domain))
+                .post(format!(
+                    "{}/workspace/domains/{}/verify",
+                    self.base_url, domain
+                ))
                 .bearer_auth(key)
                 .send()
                 .await?,
@@ -385,11 +388,7 @@ impl Api {
     }
 
     /// Updates workspace policies (admin only).
-    pub async fn update_policies(
-        &self,
-        key: String,
-        payload: UpdatePoliciesPayload,
-    ) -> Result<()> {
+    pub async fn update_policies(&self, key: String, payload: UpdatePoliciesPayload) -> Result<()> {
         Self::check_response(
             self.http
                 .put(format!("{}/workspace/policies", self.base_url))
@@ -401,6 +400,35 @@ impl Api {
         .await?;
 
         Ok(())
+    }
+
+    /// Gets workspace activity log.
+    pub async fn get_activity(
+        &self,
+        key: String,
+        query: ActivityLogQuery,
+    ) -> Result<ActivityLogResponse> {
+        let mut url = format!("{}/workspace/activity", self.base_url);
+
+        // Build query string
+        let mut params = vec![];
+        if let Some(since) = query.since {
+            params.push(format!("since={}", since));
+        }
+        if let Some(event_type) = &query.event_type {
+            params.push(format!("event_type={}", event_type));
+        }
+        if let Some(limit) = query.limit {
+            params.push(format!("limit={}", limit));
+        }
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
+        }
+
+        let response =
+            Self::check_response(self.http.get(&url).bearer_auth(key).send().await?).await?;
+
+        Ok(response.json().await?)
     }
 
     async fn check_response(response: Response) -> Result<Response> {

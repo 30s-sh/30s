@@ -67,6 +67,18 @@ pub struct WorkspacePolicy {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Workspace activity log entry for auditing drop events.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkspaceActivityLog {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub event_type: String,
+    pub actor_id: Uuid,
+    pub drop_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Drop stored in Redis with automatic expiration via TTL.
 ///
 /// Drops are ephemeral encrypted secrets. The server only stores ciphertext and

@@ -16,7 +16,10 @@ pub async fn status(config: &Config) -> Result<()> {
         Ok(workspace) => {
             println!("Workspace:    {}", workspace.name);
             println!("Created:      {}", workspace.created_at.format("%Y-%m-%d"));
-            println!("Subscription: {}", format_status(&workspace.subscription_status));
+            println!(
+                "Subscription: {}",
+                format_status(&workspace.subscription_status)
+            );
             if workspace.is_paid {
                 println!("Benefits:     Unlimited internal sends, 50/month external");
             } else {
@@ -94,7 +97,11 @@ pub async fn verify_domain(config: &Config, domain: &str) -> Result<()> {
     let api_key = credentials::get_api_key().await?;
     let api = Api::new(config.api_url.clone());
 
-    let response = ui::spin("Verifying DNS record...", api.verify_domain(api_key, domain)).await?;
+    let response = ui::spin(
+        "Verifying DNS record...",
+        api.verify_domain(api_key, domain),
+    )
+    .await?;
 
     if response.workspace_created {
         ui::success(&format!(
@@ -131,7 +138,11 @@ pub async fn list_domains(config: &Config) -> Result<()> {
 
     println!("Domains:");
     for domain in domains {
-        let status = if domain.verified { "verified" } else { "pending" };
+        let status = if domain.verified {
+            "verified"
+        } else {
+            "pending"
+        };
         println!("  {} ({})", domain.domain, status);
     }
 
@@ -151,7 +162,11 @@ pub async fn policies(config: &Config) -> Result<()> {
     // TTL policies
     match (policies.min_ttl_seconds, policies.max_ttl_seconds) {
         (Some(min), Some(max)) => {
-            println!("  TTL range:      {} - {}", format_seconds(min), format_seconds(max));
+            println!(
+                "  TTL range:      {} - {}",
+                format_seconds(min),
+                format_seconds(max)
+            );
         }
         (Some(min), None) => {
             println!("  Minimum TTL:    {}", format_seconds(min));

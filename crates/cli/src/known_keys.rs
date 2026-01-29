@@ -31,7 +31,10 @@ pub struct PinnedContact {
 impl PinnedContact {
     /// Get all fingerprints as a set.
     pub fn fingerprints(&self) -> HashSet<&str> {
-        self.devices.iter().map(|d| d.fingerprint.as_str()).collect()
+        self.devices
+            .iter()
+            .map(|d| d.fingerprint.as_str())
+            .collect()
     }
 }
 
@@ -283,11 +286,21 @@ mod tests {
 
         assert_eq!(loaded.contacts.len(), 2);
         assert_eq!(
-            loaded.contacts.get("alice@example.com").unwrap().devices.len(),
+            loaded
+                .contacts
+                .get("alice@example.com")
+                .unwrap()
+                .devices
+                .len(),
             2
         );
         assert_eq!(
-            loaded.contacts.get("bob@example.com").unwrap().devices.len(),
+            loaded
+                .contacts
+                .get("bob@example.com")
+                .unwrap()
+                .devices
+                .len(),
             1
         );
     }

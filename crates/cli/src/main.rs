@@ -165,6 +165,29 @@ enum Commands {
         action: Option<BillingCommands>,
     },
 
+    /// View workspace activity log (paid workspaces only)
+    #[command(after_help = "Examples:
+  30s activity                            Last 7 days, up to 50 entries
+  30s activity --since 24h                Last 24 hours
+  30s activity --since 30d                Last 30 days
+  30s activity --type drop.sent           Filter by event type
+  30s activity --limit 100                Fetch up to 100 entries
+  30s activity --all                      Fetch all entries")]
+    Activity {
+        /// Time range: 24h, 7d, 30d, or ISO datetime
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by event type: drop.sent, drop.opened, drop.deleted
+        #[arg(long = "type")]
+        event_type: Option<String>,
+        /// Max entries to return (default 50)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Fetch all entries
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Generate shell completions
     #[command(after_help = "Examples:
   30s completions bash > ~/.bash_completion.d/30s
@@ -396,6 +419,12 @@ async fn run() -> anyhow::Result<()> {
             Some(BillingCommands::Manage) => commands::billing::manage(&config).await,
             None => commands::billing::status(&config).await,
         },
+        Commands::Activity {
+            since,
+            event_type,
+            limit,
+            all,
+        } => commands::activity::run(&config, since, event_type, limit, all).await,
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "30s", &mut std::io::stdout());
             Ok(())

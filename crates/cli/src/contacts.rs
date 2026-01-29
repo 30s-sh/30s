@@ -221,7 +221,12 @@ mod tests {
         let contacts = Contacts::default();
         let result = expand_recipients(&["unknown".to_string()], &contacts);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown recipient"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown recipient")
+        );
     }
 
     #[test]
@@ -229,7 +234,10 @@ mod tests {
         let mut contacts = Contacts::default();
         contacts.groups.insert(
             "team".to_string(),
-            vec!["alice@example.com".to_string(), "bob@example.com".to_string()],
+            vec![
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+            ],
         );
 
         let result = expand_recipients(&["@team".to_string()], &contacts).unwrap();
@@ -288,14 +296,20 @@ mod tests {
             .insert("alice".to_string(), "alice@example.com".to_string());
         contacts.groups.insert(
             "team".to_string(),
-            vec!["bob@example.com".to_string(), "alice@example.com".to_string()],
+            vec![
+                "bob@example.com".to_string(),
+                "alice@example.com".to_string(),
+            ],
         );
 
         let toml_str = toml::to_string_pretty(&contacts).unwrap();
         let loaded: Contacts = toml::from_str(&toml_str).unwrap();
 
         assert_eq!(loaded.aliases.len(), 2);
-        assert_eq!(loaded.aliases.get("bob"), Some(&"bob@example.com".to_string()));
+        assert_eq!(
+            loaded.aliases.get("bob"),
+            Some(&"bob@example.com".to_string())
+        );
         assert_eq!(loaded.groups.len(), 1);
         assert_eq!(loaded.groups.get("team").unwrap().len(), 2);
     }

@@ -44,6 +44,7 @@ use shared::api::{AppliedPolicies, CreateDropPayload, CreateDropResponse, Drop, 
 use uuid::Uuid;
 
 use crate::{
+    activity::{events, is_internal_send, log_activity},
     error::AppError,
     middleware::auth::AuthUser,
     models::{StoredDrop, User, Workspace, WorkspacePolicy},
@@ -66,10 +67,7 @@ async fn check_rate_limit(
     error_msg: &'static str,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let count: i64 = redis::cmd("INCR")
-        .arg(key)
-        .query_async(redis)
-        .await?;
+    let count: i64 = redis::cmd("INCR").arg(key).query_async(redis).await?;
 
     if count == 1 {
         // First request this month - set TTL to expire at start of next month
@@ -91,10 +89,7 @@ async fn check_rate_limit(
     }
 
     if count > limit {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            error_msg,
-        ));
+        return Err(AppError::External(StatusCode::TOO_MANY_REQUESTS, error_msg));
     }
 
     Ok(())
@@ -158,10 +153,13 @@ async fn create_drop(
     let mut effective_expires_at = payload.expires_at;
     let mut effective_once = payload.once;
 
+    // Store workspace domains for reuse in activity logging
+    let mut workspace_domains: Option<Vec<String>> = None;
+
     if let Some(ref workspace) = paid_workspace {
         // Paid workspace: unlimited internal, 50/month external
         // Get all verified domains for this workspace
-        let workspace_domains: Vec<String> = sqlx::query_scalar!(
+        let domains: Vec<String> = sqlx::query_scalar!(
             r#"
             SELECT domain FROM workspace_domains
             WHERE workspace_id = $1 AND verified_at IS NOT NULL
@@ -170,6 +168,9 @@ async fn create_drop(
         )
         .fetch_all(&state.database)
         .await?;
+        workspace_domains = Some(domains);
+        // Use the stored domains - safe because we just set it
+        let domains = workspace_domains.as_ref().unwrap();
 
         // Fetch workspace policies
         let policy = sqlx::query_as!(
@@ -186,6 +187,19 @@ async fn create_drop(
             if let Some(min_ttl) = p.min_ttl_seconds
                 && requested_ttl < min_ttl as i64
             {
+                log_activity(
+                    &state.database,
+                    workspace.id,
+                    events::DROP_FAILED,
+                    user.id,
+                    None,
+                    serde_json::json!({
+                        "reason": "ttl_below_minimum",
+                        "requested_ttl": requested_ttl,
+                        "min_ttl": min_ttl,
+                    }),
+                )
+                .await;
                 return Err(AppError::External(
                     StatusCode::BAD_REQUEST,
                     "TTL below workspace minimum",
@@ -194,6 +208,19 @@ async fn create_drop(
             if let Some(max_ttl) = p.max_ttl_seconds
                 && requested_ttl > max_ttl as i64
             {
+                log_activity(
+                    &state.database,
+                    workspace.id,
+                    events::DROP_FAILED,
+                    user.id,
+                    None,
+                    serde_json::json!({
+                        "reason": "ttl_exceeds_maximum",
+                        "requested_ttl": requested_ttl,
+                        "max_ttl": max_ttl,
+                    }),
+                )
+                .await;
                 return Err(AppError::External(
                     StatusCode::BAD_REQUEST,
                     "TTL exceeds workspace maximum",
@@ -206,7 +233,19 @@ async fn create_drop(
                     let recipient_domain = email.split('@').nth(1).ok_or_else(|| {
                         AppError::Validation(format!("Invalid email format: {}", email))
                     })?;
-                    if !workspace_domains.iter().any(|d| d == recipient_domain) {
+                    if !domains.iter().any(|d| d == recipient_domain) {
+                        log_activity(
+                            &state.database,
+                            workspace.id,
+                            events::DROP_FAILED,
+                            user.id,
+                            None,
+                            serde_json::json!({
+                                "reason": "external_recipients_blocked",
+                                "recipient_count": recipient_emails.len(),
+                            }),
+                        )
+                        .await;
                         return Err(AppError::External(
                             StatusCode::FORBIDDEN,
                             "Workspace policy prohibits sending to external recipients",
@@ -230,13 +269,17 @@ async fn create_drop(
             if p.require_once == Some(true) && !payload.once {
                 effective_once = true;
                 applied_policies = Some(AppliedPolicies {
-                    default_ttl_applied: applied_policies.as_ref().and_then(|a| a.default_ttl_applied),
+                    default_ttl_applied: applied_policies
+                        .as_ref()
+                        .and_then(|a| a.default_ttl_applied),
                     once_enforced: Some(true),
                 });
             } else if p.default_once == Some(true) && !payload.once {
                 effective_once = true;
                 applied_policies = Some(AppliedPolicies {
-                    default_ttl_applied: applied_policies.as_ref().and_then(|a| a.default_ttl_applied),
+                    default_ttl_applied: applied_policies
+                        .as_ref()
+                        .and_then(|a| a.default_ttl_applied),
                     once_enforced: Some(true),
                 });
             }
@@ -252,24 +295,39 @@ async fn create_drop(
                     Some(domain) => domain,
                     None => return true, // Treat invalid emails as external (will fail recipient lookup anyway)
                 };
-                !workspace_domains.iter().any(|d| d == recipient_domain)
+                !domains.iter().any(|d| d == recipient_domain)
             })
             .count();
 
         if external_count > 0 {
             // Apply external rate limit
-            check_rate_limit(
+            if let Err(e) = check_rate_limit(
                 &mut redis,
                 &format!("ratelimit:drops:external:{}:{}", user.id, now.format("%Y-%m")),
                 50,
                 "Monthly external recipient limit exceeded (50/month). Internal sends are unlimited.",
                 now,
             )
-            .await?;
+            .await
+            {
+                log_activity(
+                    &state.database,
+                    workspace.id,
+                    events::DROP_FAILED,
+                    user.id,
+                    None,
+                    serde_json::json!({
+                        "reason": "external_rate_limit_exceeded",
+                        "external_count": external_count,
+                    }),
+                )
+                .await;
+                return Err(e);
+            }
         }
         // If all recipients are internal, no rate limit applies
     } else {
-        // Free tier: 50 sends/month total
+        // Free tier: 50 sends/month total (no workspace to log to)
         check_rate_limit(
             &mut redis,
             &format!("ratelimit:drops:{}:{}", user.id, now.format("%Y-%m")),
@@ -345,6 +403,27 @@ async fn create_drop(
         recipient_count = recipient_emails.len(),
         "drop created"
     );
+
+    // Log activity if sender belongs to a paid workspace
+    if let Some(ref workspace) = paid_workspace {
+        // Use workspace_domains we fetched earlier (safe unwrap, always set for paid workspaces)
+        let domains = workspace_domains.as_ref().unwrap();
+        let is_internal = is_internal_send(&recipient_emails, domains);
+
+        log_activity(
+            &state.database,
+            workspace.id,
+            events::DROP_SENT,
+            user.id,
+            Some(drop_id),
+            serde_json::json!({
+                "recipient_count": recipient_emails.len(),
+                "internal": is_internal,
+                "once": effective_once,
+            }),
+        )
+        .await;
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -435,6 +514,43 @@ async fn get_drop(
 
     tracing::info!(drop_id = %id, user_id = %user.id, once = stored_drop.once, "drop accessed");
 
+    // Log activity if either sender or recipient belongs to a paid workspace
+    // We log to the sender's workspace (they own the drop)
+    let sender_domain = stored_drop
+        .sender_email
+        .split('@')
+        .nth(1)
+        .unwrap_or_default();
+
+    if let Some(sender_workspace) = sqlx::query_as!(
+        Workspace,
+        r#"
+        SELECT w.*
+        FROM workspaces w
+        JOIN workspace_domains wd ON wd.workspace_id = w.id
+        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
+        AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
+        "#,
+        sender_domain
+    )
+    .fetch_optional(&state.database)
+    .await
+    .ok()
+    .flatten()
+    {
+        log_activity(
+            &state.database,
+            sender_workspace.id,
+            events::DROP_OPENED,
+            user.id,
+            Some(id),
+            serde_json::json!({
+                "sender_email": stored_drop.sender_email,
+            }),
+        )
+        .await;
+    }
+
     // If burn-after-reading is enabled, delete the drop after retrieval
     if stored_drop.once {
         // Delete the drop from Redis
@@ -521,6 +637,43 @@ async fn delete_drop(
         }
 
         tracing::info!(drop_id = %id, user_id = %user.id, "drop deleted");
+
+        // Log activity if sender belongs to a paid workspace
+        let sender_domain = stored_drop
+            .sender_email
+            .split('@')
+            .nth(1)
+            .unwrap_or_default();
+
+        if let Some(workspace) = sqlx::query_as!(
+            Workspace,
+            r#"
+            SELECT w.*
+            FROM workspaces w
+            JOIN workspace_domains wd ON wd.workspace_id = w.id
+            WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
+            AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
+            "#,
+            sender_domain
+        )
+        .fetch_optional(&state.database)
+        .await
+        .ok()
+        .flatten()
+        {
+            let recipient_count = stored_drop.wrapped_keys.len();
+            log_activity(
+                &state.database,
+                workspace.id,
+                events::DROP_DELETED,
+                user.id,
+                Some(id),
+                serde_json::json!({
+                    "recipient_count": recipient_count,
+                }),
+            )
+            .await;
+        }
     }
 
     // Return success even if drop didn't exist (idempotent)

@@ -301,6 +301,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-extra",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "envy",
@@ -4630,6 +4631,7 @@ dependencies = [
  "chrono",
  "garde",
  "serde",
+ "serde_json",
  "sqlx",
  "uuid 1.20.0",
 ]

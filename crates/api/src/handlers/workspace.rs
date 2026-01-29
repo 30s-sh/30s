@@ -1,8 +1,7 @@
 //! Workspace management endpoints for domain verification and workspace info.
 
 use axum::{
-    Json, Router,
-    debug_handler,
+    Json, Router, debug_handler,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
@@ -10,8 +9,8 @@ use axum::{
 };
 use garde::Validate;
 use shared::api::{
-    AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo,
-    UpdatePoliciesPayload, VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
+    AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo, UpdatePoliciesPayload,
+    VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
 };
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
@@ -207,7 +206,10 @@ async fn add_domain(
 ) -> Result<impl IntoResponse, AppError> {
     // Validate domain format (basic check)
     let domain = payload.domain.to_lowercase();
-    if domain.is_empty() || !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.')
+    if domain.is_empty()
+        || !domain.contains('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
     {
         return Err(AppError::Validation("Invalid domain format".to_string()));
     }
@@ -327,7 +329,7 @@ async fn verify_domain(
             return Err(AppError::External(
                 StatusCode::NOT_FOUND,
                 "No pending verification for this domain. Add it first: 30s workspace domain add",
-            ))
+            ));
         }
     };
 
@@ -339,9 +341,9 @@ async fn verify_domain(
     }
 
     // Get the workspace and check subscription status
-    let workspace_id = pending.workspace_id.ok_or_else(|| {
-        AppError::Internal(anyhow::anyhow!("Domain not linked to a workspace"))
-    })?;
+    let workspace_id = pending
+        .workspace_id
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Domain not linked to a workspace")))?;
 
     let workspace = sqlx::query_as!(
         Workspace,
@@ -363,17 +365,13 @@ async fn verify_domain(
     let txt_host = format!("{}.", txt_record_host(&domain));
     let expected_value = txt_record_value(&pending.verification_token);
 
-    let records = state
-        .dns
-        .lookup_txt(&txt_host)
-        .await
-        .map_err(|e| {
-            tracing::warn!("DNS lookup failed for {}: {}", txt_host, e);
-            AppError::External(
-                StatusCode::BAD_REQUEST,
-                "DNS lookup failed - please ensure the TXT record is configured",
-            )
-        })?;
+    let records = state.dns.lookup_txt(&txt_host).await.map_err(|e| {
+        tracing::warn!("DNS lookup failed for {}: {}", txt_host, e);
+        AppError::External(
+            StatusCode::BAD_REQUEST,
+            "DNS lookup failed - please ensure the TXT record is configured",
+        )
+    })?;
 
     let verified = records.iter().any(|r| r.contains(&expected_value));
 
@@ -398,11 +396,7 @@ async fn verify_domain(
     .execute(&state.database)
     .await?;
 
-    tracing::info!(
-        "Domain {} verified for workspace {}",
-        domain,
-        workspace_id
-    );
+    tracing::info!("Domain {} verified for workspace {}", domain, workspace_id);
 
     Ok(Json(VerifyDomainResponse {
         domain,
@@ -432,7 +426,7 @@ async fn list_domains(
             return Err(AppError::External(
                 StatusCode::FORBIDDEN,
                 "You must be a workspace admin to list domains",
-            ))
+            ));
         }
     };
 
@@ -521,7 +515,7 @@ async fn update_policies(
             return Err(AppError::External(
                 StatusCode::FORBIDDEN,
                 "Only workspace admins can update policies",
-            ))
+            ));
         }
     };
 

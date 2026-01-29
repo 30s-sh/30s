@@ -428,7 +428,10 @@ mod tests {
         let fp1 = fingerprint(&public1);
         let fp2 = fingerprint(&public2);
 
-        assert_ne!(fp1, fp2, "Different keys should produce different fingerprints");
+        assert_ne!(
+            fp1, fp2,
+            "Different keys should produce different fingerprints"
+        );
     }
 
     #[test]

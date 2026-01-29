@@ -1,3 +1,4 @@
+mod activity;
 mod config;
 mod dns;
 mod email;
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
         .nest("/devices", handlers::devices::router())
         .nest("/drops", handlers::drops::router())
         .nest("/workspace", handlers::workspace::router())
+        .nest("/workspace", handlers::activity::router())
         .with_state(state)
         // Request ID: generate UUID, include in logs, return in response
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
