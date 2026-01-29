@@ -321,7 +321,6 @@ async fn create_drop(
         once: effective_once,
     };
 
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
     let drop_key = format!("drop:{}", drop_id);
 
     // Store the drop with TTL
