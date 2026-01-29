@@ -84,7 +84,7 @@ pub struct WorkspaceActivityLog {
 /// Drops are ephemeral encrypted secrets. The server only stores ciphertext and
 /// per-recipient wrapped keys - it never sees the plaintext. Each drop expires
 /// automatically via Redis TTL based on the sender's chosen expiration time.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredDrop {
     pub id: String,
     pub sender_email: String,

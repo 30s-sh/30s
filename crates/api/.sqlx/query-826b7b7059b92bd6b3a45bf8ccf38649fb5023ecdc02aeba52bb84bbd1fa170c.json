@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT w.*\n            FROM workspaces w\n            JOIN workspace_domains wd ON wd.workspace_id = w.id\n            WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL\n            AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')\n            ",
+  "query": "\n            SELECT w.id, w.name, w.created_at, w.stripe_customer_id, w.stripe_subscription_id, w.subscription_status\n            FROM workspaces w\n            JOIN workspace_domains wd ON wd.workspace_id = w.id\n            WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "90fdfbb17725576ffeb4419982e5cbbcc45fc6f47412d229a16d4f2d162c44d0"
+  "hash": "826b7b7059b92bd6b3a45bf8ccf38649fb5023ecdc02aeba52bb84bbd1fa170c"
 }

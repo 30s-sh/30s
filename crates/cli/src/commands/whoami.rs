@@ -30,3 +30,48 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::api::Api;
+    use shared::api::MeResponse;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    #[tokio::test]
+    async fn get_me_api_call_returns_email() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(MeResponse {
+                email: "alice@example.com".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.get_me("test-api-key".to_string()).await.unwrap();
+
+        assert_eq!(result.email, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn get_me_api_call_with_invalid_key_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.get_me("bad-key".to_string()).await;
+
+        assert!(result.is_err());
+    }
+}

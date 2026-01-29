@@ -82,3 +82,93 @@ pub async fn keys(config: &Config) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::api::Api;
+    use shared::api::RotateVerifyResponse;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    #[tokio::test]
+    async fn request_rotate_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/rotate"))
+            .and(header("Authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.request_rotate("test-key".to_string()).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_rotate_rate_limited() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/rotate"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(serde_json::json!({"error": "Too many requests"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.request_rotate("test-key".to_string()).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Too many requests"));
+    }
+
+    #[tokio::test]
+    async fn verify_rotate_returns_new_key() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/rotate/verify"))
+            .and(header("Authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(RotateVerifyResponse {
+                api_key: "new-api-key".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api
+            .verify_rotate("test-key".to_string(), "123456".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(result.api_key, "new-api-key");
+    }
+
+    #[tokio::test]
+    async fn verify_rotate_invalid_code() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/rotate/verify"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "Invalid code"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api
+            .verify_rotate("test-key".to_string(), "wrong".to_string())
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid code"));
+    }
+}

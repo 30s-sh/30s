@@ -1,18 +1,28 @@
 use std::sync::Arc;
 
-use sqlx::{Pool, Postgres};
 use stripe::Client as StripeClient;
 
-use crate::{dns::DnsResolver, email::EmailSender, unkey};
+use crate::{
+    config::Config,
+    repos::Repos,
+    services::{AuthService, DnsResolver, EmailSender},
+    stores::Stores,
+};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub database: Pool<Postgres>,
-    pub redis: redis::Client,
-    pub unkey: unkey::Client,
-    pub email: Arc<EmailSender>,
+    /// Application configuration.
+    pub config: Config,
+    /// Database repositories.
+    pub repos: Repos,
+    /// Ephemeral stores (Redis).
+    pub stores: Stores,
+    /// Authentication service (Unkey).
+    pub auth: Arc<dyn AuthService>,
+    /// Email sender.
+    pub email: Arc<dyn EmailSender>,
+    /// DNS resolver.
     pub dns: Arc<dyn DnsResolver>,
+    /// Stripe client.
     pub stripe: StripeClient,
-    pub stripe_webhook_secret: String,
-    pub stripe_price_id: String,
 }

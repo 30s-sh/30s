@@ -4,21 +4,30 @@
 //! This allows local development without a Resend account.
 
 use anyhow::Result;
+use async_trait::async_trait;
 use lettre::{
     Message, SmtpTransport, Transport,
     message::{Mailbox, header::ContentType},
 };
 use resend_rs::types::CreateEmailBaseOptions;
 
-/// Email sender abstraction.
-pub enum EmailSender {
+/// Email sender trait for mockability.
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait EmailSender: Send + Sync {
+    /// Send a verification code email.
+    async fn send_verification_code(&self, to: &str, code: &str) -> Result<()>;
+}
+
+/// Email sender implementation that dispatches to SMTP or Resend.
+pub enum EmailSenderImpl {
     /// SMTP-based sender using lettre (for development)
     Smtp(SmtpSender),
     /// Resend API sender (for production)
     Resend(ResendSender),
 }
 
-impl EmailSender {
+impl EmailSenderImpl {
     /// Create a new email sender based on config.
     /// Uses Resend if api key is provided, otherwise falls back to SMTP.
     pub fn new(resend_api_key: Option<String>, smtp_url: Option<String>) -> Result<Self> {
@@ -30,9 +39,11 @@ impl EmailSender {
             anyhow::bail!("Either RESEND_API_KEY or SMTP_URL must be configured")
         }
     }
+}
 
-    /// Send a verification code email.
-    pub async fn send_verification_code(&self, to: &str, code: &str) -> Result<()> {
+#[async_trait]
+impl EmailSender for EmailSenderImpl {
+    async fn send_verification_code(&self, to: &str, code: &str) -> Result<()> {
         match self {
             Self::Resend(sender) => sender.send_verification_code(to, code).await,
             Self::Smtp(sender) => sender.send_verification_code(to, code),

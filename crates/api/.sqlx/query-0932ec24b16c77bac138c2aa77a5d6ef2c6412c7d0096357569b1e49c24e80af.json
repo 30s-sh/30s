@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT w.*\n        FROM workspaces w\n        JOIN workspace_domains wd ON wd.workspace_id = w.id\n        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL\n        ",
+  "query": "\n            SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status\n            FROM workspaces WHERE stripe_customer_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "7e6ced9a3c4f6ca478352b7ec2fedf444217a3fbc292cd62ecb662788ed6c50f"
+  "hash": "0932ec24b16c77bac138c2aa77a5d6ef2c6412c7d0096357569b1e49c24e80af"
 }

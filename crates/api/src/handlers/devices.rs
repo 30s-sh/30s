@@ -23,12 +23,7 @@ use garde::Validate;
 use shared::api::{DeviceInfo, DevicePublicKey, GetPublicKeysPayload, RegisterDevicePayload};
 use uuid::Uuid;
 
-use crate::{
-    error::AppError,
-    middleware::auth::AuthUser,
-    models::{Device, User},
-    state::AppState,
-};
+use crate::{error::AppError, middleware::auth::AuthUser, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -51,14 +46,11 @@ async fn register_device(
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
-    let device = sqlx::query_as!(
-        Device,
-        "INSERT INTO devices (user_id, public_key) VALUES ($1, $2) RETURNING *",
-        user.id,
-        payload.public_key,
-    )
-    .fetch_one(&state.database)
-    .await?;
+    let device = state
+        .repos
+        .devices
+        .create(user.id, &payload.public_key)
+        .await?;
 
     tracing::info!(user_id = %user.id, device_id = %device.id, "device registered");
 
@@ -81,20 +73,9 @@ async fn get_public_keys(
     let mut result = Vec::new();
 
     for email in payload.emails {
-        let user = sqlx::query_as!(
-            User,
-            "SELECT * FROM users WHERE email = $1 AND verified_at IS NOT NULL",
-            email
-        )
-        .fetch_optional(&state.database)
-        .await?;
-
-        if let Some(user) = user {
+        if let Some(user) = state.repos.users.find_verified_by_email(&email).await? {
             // Get ALL devices so the recipient can decrypt on any device
-            let devices =
-                sqlx::query_as!(Device, "SELECT * FROM devices WHERE user_id = $1", user.id)
-                    .fetch_all(&state.database)
-                    .await?;
+            let devices = state.repos.devices.list_by_user(user.id).await?;
 
             for device in devices {
                 result.push(DevicePublicKey {
@@ -114,13 +95,7 @@ async fn list_devices(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let devices = sqlx::query_as!(
-        Device,
-        "SELECT * FROM devices WHERE user_id = $1 ORDER BY created_at DESC",
-        user.id
-    )
-    .fetch_all(&state.database)
-    .await?;
+    let devices = state.repos.devices.list_by_user(user.id).await?;
 
     let result: Vec<DeviceInfo> = devices
         .into_iter()
@@ -140,14 +115,11 @@ async fn get_device(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let device = sqlx::query_as!(
-        Device,
-        "SELECT * FROM devices WHERE id = $1 AND user_id = $2",
-        id,
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let device = state
+        .repos
+        .devices
+        .find_by_id_and_user(id, user.id)
+        .await?;
 
     match device {
         Some(d) => Ok(Json(DeviceInfo {
@@ -173,16 +145,13 @@ async fn update_device(
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
-    let result = sqlx::query!(
-        "UPDATE devices SET public_key = $1 WHERE id = $2 AND user_id = $3",
-        payload.public_key,
-        id,
-        user.id
-    )
-    .execute(&state.database)
-    .await?;
+    let updated = state
+        .repos
+        .devices
+        .update_public_key(id, user.id, &payload.public_key)
+        .await?;
 
-    if result.rows_affected() == 0 {
+    if !updated {
         return Err(AppError::External(
             StatusCode::NOT_FOUND,
             "Device not found",
@@ -202,18 +171,255 @@ async fn delete_device(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Delete only if owned by the authenticated user
-    let result = sqlx::query!(
-        "DELETE FROM devices WHERE id = $1 AND user_id = $2",
-        id,
-        user.id
-    )
-    .execute(&state.database)
-    .await?;
+    let deleted = state.repos.devices.delete(id, user.id).await?;
 
-    if result.rows_affected() > 0 {
+    if deleted {
         tracing::info!(user_id = %user.id, device_id = %id, "device deleted");
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repos::MockDeviceRepo;
+    use crate::test_utils::{mock_device, TestStateBuilder};
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn list_devices_returns_user_devices() {
+        let user_id = Uuid::new_v4();
+        let device1 = mock_device(user_id);
+        let device2 = mock_device(user_id);
+        let devices = vec![device1.clone(), device2.clone()];
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_list_by_user()
+            .with(mockall::predicate::eq(user_id))
+            .returning(move |_| Ok(devices.clone()));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let result = list_devices(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn register_device_creates_new_device() {
+        let user_id = Uuid::new_v4();
+        let device = mock_device(user_id);
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_create()
+            .with(
+                mockall::predicate::eq(user_id),
+                mockall::predicate::eq("new-public-key"),
+            )
+            .returning(move |_, _| Ok(device.clone()));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let payload = RegisterDevicePayload {
+            public_key: "new-public-key".to_string(),
+        };
+
+        let result = register_device(
+            AuthUser { id: user_id },
+            State(state),
+            Json(payload),
+        )
+        .await
+        .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn delete_device_returns_ok_when_deleted() {
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_delete()
+            .with(
+                mockall::predicate::eq(device_id),
+                mockall::predicate::eq(user_id),
+            )
+            .returning(|_, _| Ok(true));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let result = delete_device(AuthUser { id: user_id }, State(state), Path(device_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_device_returns_ok_when_not_found() {
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_delete()
+            .returning(|_, _| Ok(false)); // Device not found
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let result = delete_device(AuthUser { id: user_id }, State(state), Path(device_id))
+            .await
+            .unwrap();
+
+        // Should still return OK (idempotent)
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_device_returns_device_info() {
+        let user_id = Uuid::new_v4();
+        let device = mock_device(user_id);
+        let device_id = device.id;
+
+        let mut device_repo = MockDeviceRepo::new();
+        let device_clone = device.clone();
+        device_repo
+            .expect_find_by_id_and_user()
+            .with(
+                mockall::predicate::eq(device_id),
+                mockall::predicate::eq(user_id),
+            )
+            .returning(move |_, _| Ok(Some(device_clone.clone())));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let result = get_device(AuthUser { id: user_id }, State(state), Path(device_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_device_returns_not_found() {
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_find_by_id_and_user()
+            .returning(|_, _| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let result = get_device(AuthUser { id: user_id }, State(state), Path(device_id)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_device_updates_public_key() {
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_update_public_key()
+            .with(
+                mockall::predicate::eq(device_id),
+                mockall::predicate::eq(user_id),
+                mockall::predicate::eq("updated-key"),
+            )
+            .returning(|_, _, _| Ok(true));
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let payload = RegisterDevicePayload {
+            public_key: "updated-key".to_string(),
+        };
+
+        let result = update_device(
+            AuthUser { id: user_id },
+            State(state),
+            Path(device_id),
+            Json(payload),
+        )
+        .await
+        .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_device_returns_not_found() {
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_update_public_key()
+            .returning(|_, _, _| Ok(false)); // Device not found
+
+        let state = TestStateBuilder::new()
+            .with_device_repo(device_repo)
+            .build();
+
+        let payload = RegisterDevicePayload {
+            public_key: "updated-key".to_string(),
+        };
+
+        let result = update_device(
+            AuthUser { id: user_id },
+            State(state),
+            Path(device_id),
+            Json(payload),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
 }

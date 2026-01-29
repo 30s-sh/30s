@@ -48,3 +48,79 @@ pub async fn run(config: &Config) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::api::Api;
+    use chrono::Utc;
+    use shared::api::InboxItem;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    #[tokio::test]
+    async fn get_inbox_returns_drops() {
+        let mock_server = MockServer::start().await;
+
+        let items = vec![
+            InboxItem {
+                id: "drop-1".to_string(),
+                sender_email: "alice@example.com".to_string(),
+                created_at: Utc::now(),
+            },
+            InboxItem {
+                id: "drop-2".to_string(),
+                sender_email: "bob@example.com".to_string(),
+                created_at: Utc::now(),
+            },
+        ];
+
+        Mock::given(method("GET"))
+            .and(path("/drops/inbox"))
+            .and(header("Authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&items))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.get_inbox("test-key".to_string()).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, "drop-1");
+        assert_eq!(result[0].sender_email, "alice@example.com");
+        assert_eq!(result[1].id, "drop-2");
+    }
+
+    #[tokio::test]
+    async fn get_inbox_empty() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/drops/inbox"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<InboxItem>::new()))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.get_inbox("test-key".to_string()).await.unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_inbox_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/drops/inbox"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.get_inbox("bad-key".to_string()).await;
+
+        assert!(result.is_err());
+    }
+}

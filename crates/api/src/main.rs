@@ -1,13 +1,14 @@
-mod activity;
 mod config;
-mod dns;
-mod email;
 mod error;
 mod handlers;
 mod middleware;
 mod models;
+mod repos;
+mod services;
 mod state;
-mod unkey;
+mod stores;
+#[cfg(test)]
+mod test_utils;
 
 use std::net::SocketAddr;
 
@@ -23,7 +24,13 @@ use tower_http::{
 };
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::Config, dns::HickoryDnsResolver, email::EmailSender, state::AppState};
+use crate::{
+    config::Config,
+    repos::{PgActivityRepo, PgDeviceRepo, PgStatusRepo, PgUserRepo, PgWorkspaceRepo, Repos},
+    services::{EmailSenderImpl, HickoryDnsResolver, UnkeyAuthService, unkey},
+    state::AppState,
+    stores::{RedisDropStore, RedisInboxStore, RedisRateLimiter, RedisVerificationStore, Stores},
+};
 
 #[derive(Parser)]
 #[command(name = "api")]
@@ -85,21 +92,40 @@ async fn main() -> Result<()> {
 
     let redis = redis::Client::open(config.redis_url.as_str())?;
     let unkey = unkey::Client::new(&config.unkey_root_key, &config.unkey_api_id);
-    let email = EmailSender::new(config.resend_api_key.clone(), config.smtp_url.clone())?;
+    let email = EmailSenderImpl::new(config.resend_api_key.clone(), config.smtp_url.clone())?;
 
     let dns = HickoryDnsResolver::new()?;
 
     let stripe = stripe::Client::new(&config.stripe_secret_key);
 
+    // Build repositories
+    let repos = Repos {
+        users: std::sync::Arc::new(PgUserRepo::new(database.clone())),
+        devices: std::sync::Arc::new(PgDeviceRepo::new(database.clone())),
+        workspaces: std::sync::Arc::new(PgWorkspaceRepo::new(database.clone())),
+        activity: std::sync::Arc::new(PgActivityRepo::new(database.clone())),
+        status: std::sync::Arc::new(PgStatusRepo::new(database)),
+    };
+
+    // Build stores
+    let stores = Stores {
+        drops: std::sync::Arc::new(RedisDropStore::new(redis.clone())),
+        inbox: std::sync::Arc::new(RedisInboxStore::new(redis.clone())),
+        verification: std::sync::Arc::new(RedisVerificationStore::new(redis.clone())),
+        rate_limiter: std::sync::Arc::new(RedisRateLimiter::new(redis.clone())),
+    };
+
+    // Build auth service
+    let auth = std::sync::Arc::new(UnkeyAuthService::new(unkey));
+
     let state = AppState {
-        database,
-        redis,
-        unkey,
+        config: config.clone(),
+        repos,
+        stores,
+        auth,
         email: std::sync::Arc::new(email),
         dns: std::sync::Arc::new(dns),
         stripe,
-        stripe_webhook_secret: config.stripe_webhook_secret.clone(),
-        stripe_price_id: config.stripe_price_id.clone(),
     };
 
     // Request ID header name

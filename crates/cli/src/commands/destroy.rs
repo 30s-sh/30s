@@ -38,3 +38,65 @@ pub async fn run(config: &Config) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::api::Api;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    #[tokio::test]
+    async fn delete_account_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/auth/me"))
+            .and(header("Authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.delete_account("test-key".to_string()).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_account_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/auth/me"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.delete_account("bad-key".to_string()).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_account_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/auth/me"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "User not found"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let api = Api::new(mock_server.uri());
+        let result = api.delete_account("test-key".to_string()).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("User not found"));
+    }
+}

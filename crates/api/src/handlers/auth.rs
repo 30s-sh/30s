@@ -22,46 +22,15 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::Utc;
 use garde::Validate;
 use rand::Rng;
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::api::{
     MeResponse, RequestCodePayload, RotateVerifyPayload, RotateVerifyResponse, VerifyCodePayload,
     VerifyCodeResponse,
 };
 
-use crate::{error::AppError, middleware::auth::AuthUser, models::User, state::AppState};
-
-/// Check rate limit using Redis INCR + EXPIRE pattern.
-/// Returns `Err(TOO_MANY_REQUESTS)` if limit exceeded.
-async fn check_rate_limit(
-    redis: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-    limit: i64,
-    ttl_secs: u64,
-) -> Result<(), AppError> {
-    let count: i64 = redis::cmd("INCR").arg(key).query_async(redis).await?;
-
-    if count == 1 {
-        let _: () = redis::cmd("EXPIRE")
-            .arg(key)
-            .arg(ttl_secs)
-            .query_async(redis)
-            .await?;
-    }
-
-    if count > limit {
-        return Err(AppError::External(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many requests. Try again later.",
-        ));
-    }
-
-    Ok(())
-}
+use crate::{error::AppError, middleware::auth::AuthUser, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -77,20 +46,14 @@ async fn get_me(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let db_user = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
-    Ok(Json(MeResponse { email: user.email }))
-}
-
-/// Stored in Redis, keyed by the hashed code. The email field lets us verify
-/// the code was requested by the same email attempting to use it.
-#[derive(Debug, Serialize, Deserialize)]
-struct VerifyState {
-    email: String,
-    code: String,
-    created_at: i64,
+    Ok(Json(MeResponse { email: db_user.email }))
 }
 
 #[debug_handler]
@@ -103,14 +66,17 @@ async fn request_code(
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Rate limit: 5 code requests per hour per email
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    check_rate_limit(
-        &mut redis,
-        &format!("ratelimit:code:{}", payload.email),
-        5,
-        3600,
-    )
-    .await?;
+    let result = state
+        .stores
+        .rate_limiter
+        .check_simple(&format!("ratelimit:code:{}", payload.email), 5, 3600)
+        .await?;
+    if !result.is_allowed() {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Try again later.",
+        ));
+    }
 
     let code: String = {
         let mut rng = rand::rng();
@@ -125,17 +91,10 @@ async fn request_code(
     let hashed = hex::encode(hasher.finalize());
 
     // Store keyed by hash so verification is O(1) lookup. TTL of 15 minutes.
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let _: () = redis
-        .set_ex(
-            format!("verify-{}", hashed),
-            serde_json::to_string(&VerifyState {
-                email: payload.email.clone(),
-                code: hashed.clone(),
-                created_at: Utc::now().timestamp(),
-            })?,
-            15 * 60,
-        )
+    state
+        .stores
+        .verification
+        .store_verify_code(&hashed, &payload.email, 15 * 60)
         .await?;
 
     state
@@ -158,14 +117,21 @@ async fn verify_code(
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Rate limit: 10 verify attempts per 15 minutes per email
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    check_rate_limit(
-        &mut redis,
-        &format!("ratelimit:verify_code:{}", payload.email),
-        10,
-        15 * 60,
-    )
-    .await?;
+    let result = state
+        .stores
+        .rate_limiter
+        .check_simple(
+            &format!("ratelimit:verify_code:{}", payload.email),
+            10,
+            15 * 60,
+        )
+        .await?;
+    if !result.is_allowed() {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Try again later.",
+        ));
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(payload.code.as_bytes());
@@ -173,14 +139,8 @@ async fn verify_code(
 
     // GET first, DEL only after full validation. This way an attacker guessing
     // a valid code with the wrong email doesn't invalidate the legitimate user's code.
-    let code_key = format!("verify-{}", hashed);
-    let code: Option<String> = redis.get(&code_key).await?;
-
-    let verify_state = match code
-        .map(|c| serde_json::from_str::<VerifyState>(&c))
-        .transpose()?
-    {
-        Some(state) => state,
+    let verify_state = match state.stores.verification.get_verify_code(&hashed).await? {
+        Some(s) => s,
         None => {
             tracing::warn!(email = %payload.email, "verification failed: invalid code");
             return Ok(AppError::External(StatusCode::BAD_REQUEST, "Invalid code").into_response());
@@ -194,41 +154,26 @@ async fn verify_code(
     }
 
     // Code validated, now safe to delete
-    let _: () = redis.del(&code_key).await?;
+    state.stores.verification.delete_verify_code(&hashed).await?;
 
     // Create user on verify (not on code request) so we don't store unverified emails
-    let user = match sqlx::query_as!(User, "SELECT * FROM users WHERE email = $1", payload.email)
-        .fetch_optional(&state.database)
-        .await?
-    {
+    let user = match state.repos.users.find_by_email(&payload.email).await? {
         Some(user) => user,
-        None => {
-            sqlx::query_as!(
-                User,
-                "INSERT INTO users (email) VALUES ($1) RETURNING *",
-                payload.email
-            )
-            .fetch_one(&state.database)
-            .await?
-        }
+        None => state.repos.users.create(&payload.email).await?,
     };
 
-    // Create API key via Unkey
+    // Create API key via auth service
     let key_response = state
-        .unkey
-        .create_key(user.id.to_string(), format!("30s-cli-{}", &payload.email))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create API key: {}", e))?;
+        .auth
+        .create_key(&user.id.to_string(), &format!("30s-cli-{}", &payload.email))
+        .await?;
 
     // Store key_id for revocation/lookup; return the actual key to the user (shown only once)
-    sqlx::query_as!(
-        User,
-        "UPDATE users SET verified_at = now(), unkey_key_id = $2 WHERE email = $1 RETURNING *",
-        user.email,
-        key_response.key_id
-    )
-    .fetch_one(&state.database)
-    .await?;
+    state
+        .repos
+        .users
+        .set_verified(&user.email, &key_response.key_id)
+        .await?;
 
     tracing::info!(user_id = %user.id, email = %payload.email, "user verified");
 
@@ -246,19 +191,25 @@ async fn request_rotate(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Rate limit: 3 rotation code requests per hour per user
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    check_rate_limit(
-        &mut redis,
-        &format!("ratelimit:rotate:{}", user.id),
-        3,
-        3600,
-    )
-    .await?;
+    let result = state
+        .stores
+        .rate_limiter
+        .check_simple(&format!("ratelimit:rotate:{}", user.id), 3, 3600)
+        .await?;
+    if !result.is_allowed() {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Try again later.",
+        ));
+    }
 
     // Look up user's email
-    let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let db_user = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
     let code: String = {
         let mut rng = rand::rng();
@@ -272,17 +223,10 @@ async fn request_rotate(
     let hashed = hex::encode(hasher.finalize());
 
     // Store with "rotate-" prefix to distinguish from init codes
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let _: () = redis
-        .set_ex(
-            format!("rotate-{}", hashed),
-            serde_json::to_string(&VerifyState {
-                email: db_user.email.clone(),
-                code: hashed.clone(),
-                created_at: Utc::now().timestamp(),
-            })?,
-            15 * 60,
-        )
+    state
+        .stores
+        .verification
+        .store_rotate_code(&hashed, &db_user.email, 15 * 60)
         .await?;
 
     state
@@ -308,33 +252,32 @@ async fn verify_rotate(
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Rate limit: 10 verify attempts per 15 minutes per user
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    check_rate_limit(
-        &mut redis,
-        &format!("ratelimit:verify_rotate:{}", user.id),
-        10,
-        15 * 60,
-    )
-    .await?;
+    let result = state
+        .stores
+        .rate_limiter
+        .check_simple(&format!("ratelimit:verify_rotate:{}", user.id), 10, 15 * 60)
+        .await?;
+    if !result.is_allowed() {
+        return Err(AppError::External(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Try again later.",
+        ));
+    }
 
     // Look up user
-    let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let db_user = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
     let mut hasher = Sha256::new();
     hasher.update(payload.code.as_bytes());
     let hashed = hex::encode(hasher.finalize());
 
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let code_key = format!("rotate-{}", hashed);
-    let code: Option<String> = redis.get(&code_key).await?;
-
-    let verify_state = match code
-        .map(|c| serde_json::from_str::<VerifyState>(&c))
-        .transpose()?
-    {
-        Some(state) => state,
+    let verify_state = match state.stores.verification.get_rotate_code(&hashed).await? {
+        Some(s) => s,
         None => {
             tracing::warn!(user_id = %user.id, "rotation failed: invalid code");
             return Err(AppError::External(StatusCode::BAD_REQUEST, "Invalid code"));
@@ -348,35 +291,34 @@ async fn verify_rotate(
     }
 
     // Code validated, delete it
-    let _: () = redis.del(&code_key).await?;
+    state
+        .stores
+        .verification
+        .delete_rotate_code(&hashed)
+        .await?;
 
     // Revoke old key if it exists
-    if let Some(old_key_id) = &db_user.unkey_key_id {
-        state
-            .unkey
-            .delete_key(old_key_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to revoke old API key: {}", e))?;
+    if let Some(old_key_id) = &db_user.unkey_key_id
+        && let Err(e) = state.auth.delete_key(old_key_id).await
+    {
+        tracing::warn!(user_id = %user.id, "Failed to revoke old API key: {}", e);
     }
 
     // Create new API key
     let key_response = state
-        .unkey
+        .auth
         .create_key(
-            db_user.id.to_string(),
-            format!("30s-cli-{}", &db_user.email),
+            &db_user.id.to_string(),
+            &format!("30s-cli-{}", &db_user.email),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create API key: {}", e))?;
+        .await?;
 
     // Update stored key_id
-    sqlx::query!(
-        "UPDATE users SET unkey_key_id = $2 WHERE id = $1",
-        db_user.id,
-        key_response.key_id
-    )
-    .execute(&state.database)
-    .await?;
+    state
+        .repos
+        .users
+        .update_key_id(db_user.id, &key_response.key_id)
+        .await?;
 
     tracing::info!(user_id = %user.id, email = %db_user.email, "API key rotated");
 
@@ -392,33 +334,644 @@ async fn delete_account(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let db_user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let db_user = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
     // Revoke Unkey API key
     if let Some(key_id) = &db_user.unkey_key_id
-        && let Err(e) = state.unkey.delete_key(key_id).await
+        && let Err(e) = state.auth.delete_key(key_id).await
     {
         tracing::warn!(user_id = %user.id, "Failed to revoke Unkey key during account deletion: {}", e);
     }
 
     // Delete devices (cascade will handle this if FK is set, but be explicit)
-    sqlx::query!("DELETE FROM devices WHERE user_id = $1", user.id)
-        .execute(&state.database)
-        .await?;
+    state.repos.devices.delete_all_by_user(user.id).await?;
 
     // Delete user (this is the source of truth)
-    sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
-        .execute(&state.database)
-        .await?;
+    state.repos.users.delete(user.id).await?;
 
     // Clean up any drops from Redis inbox
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let inbox_key = format!("inbox:{}", user.id);
-    let _: () = redis.del(&inbox_key).await?;
+    state.stores.inbox.delete_all(user.id).await?;
 
     tracing::info!(user_id = %user.id, email = %db_user.email, "account deleted");
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::User;
+    use crate::repos::{MockDeviceRepo, MockUserRepo};
+    use crate::services::{CreateKeyResult, MockAuthService, MockEmailSender};
+    use crate::stores::{
+        MockInboxStore, MockRateLimiter, MockVerificationStore, RateLimitResult, VerifyState,
+    };
+    use crate::test_utils::{mock_user, TestStateBuilder};
+    use axum::http::StatusCode;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn get_me_returns_user_email() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .with(mockall::predicate::eq(user_id))
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let state = TestStateBuilder::new().with_user_repo(user_repo).build();
+
+        let result = get_me(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_me_returns_not_found_for_missing_user() {
+        let user_id = uuid::Uuid::new_v4();
+
+        let mut user_repo = MockUserRepo::new();
+        user_repo.expect_find_by_id().returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new().with_user_repo(user_repo).build();
+
+        let result = get_me(AuthUser { id: user_id }, State(state)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_account_removes_user_and_devices() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .with(mockall::predicate::eq(user_id))
+            .returning(move |_| Ok(Some(user_clone.clone())));
+        user_repo
+            .expect_delete()
+            .with(mockall::predicate::eq(user_id))
+            .returning(|_| Ok(()));
+
+        let mut device_repo = MockDeviceRepo::new();
+        device_repo
+            .expect_delete_all_by_user()
+            .with(mockall::predicate::eq(user_id))
+            .returning(|_| Ok(()));
+
+        let mut auth_service = MockAuthService::new();
+        auth_service.expect_delete_key().returning(|_| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store
+            .expect_delete_all()
+            .with(mockall::predicate::eq(user_id))
+            .returning(|_| Ok(()));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_device_repo(device_repo)
+            .with_auth_service(auth_service)
+            .with_inbox_store(inbox_store)
+            .build();
+
+        let result = delete_account(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_code_stores_and_sends_code() {
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store
+            .expect_store_verify_code()
+            .returning(|_, _, _| Ok(()));
+
+        let mut email_sender = MockEmailSender::new();
+        email_sender
+            .expect_send_verification_code()
+            .returning(|_, _| Ok(()));
+
+        let state = TestStateBuilder::new()
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .with_email_sender(email_sender)
+            .build();
+
+        let payload = RequestCodePayload {
+            email: "alice@example.com".to_string(),
+        };
+
+        let result = request_code(State(state), Json(payload)).await.unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_code_rate_limited() {
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Exceeded(6)));
+
+        let state = TestStateBuilder::new()
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = RequestCodePayload {
+            email: "alice@example.com".to_string(),
+        };
+
+        let result = request_code(State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_code_creates_user_and_returns_api_key() {
+        let user = mock_user("alice@example.com");
+        let user_clone = user.clone();
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store
+            .expect_get_verify_code()
+            .returning(move |_| {
+                Ok(Some(VerifyState {
+                    email: "alice@example.com".to_string(),
+                    code: "123456".to_string(),
+                    created_at: Utc::now().timestamp(),
+                }))
+            });
+        verification_store
+            .expect_delete_verify_code()
+            .returning(|_| Ok(()));
+
+        let mut user_repo = MockUserRepo::new();
+        user_repo.expect_find_by_email().returning(|_| Ok(None)); // New user
+        user_repo
+            .expect_create()
+            .returning(move |_| Ok(user_clone.clone()));
+        user_repo.expect_set_verified().returning(move |_, _| {
+            Ok(User {
+                id: user.id,
+                email: user.email.clone(),
+                unkey_key_id: Some("key_new".to_string()),
+                created_at: user.created_at,
+                verified_at: Some(Utc::now()),
+            })
+        });
+
+        let mut auth_service = MockAuthService::new();
+        auth_service.expect_create_key().returning(|_, _| {
+            Ok(CreateKeyResult {
+                key: "30s_test_key".to_string(),
+                key_id: "key_new".to_string(),
+            })
+        });
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .with_auth_service(auth_service)
+            .build();
+
+        let payload = VerifyCodePayload {
+            email: "alice@example.com".to_string(),
+            code: "123456".to_string(),
+        };
+
+        let result = verify_code(State(state), Json(payload)).await.unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn verify_code_not_found_returns_bad_request() {
+        // Test: code was never requested (not in store)
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store
+            .expect_get_verify_code()
+            .returning(|_| Ok(None)); // No code in store
+
+        let state = TestStateBuilder::new()
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = VerifyCodePayload {
+            email: "alice@example.com".to_string(),
+            code: "123456".to_string(),
+        };
+
+        let result = verify_code(State(state), Json(payload)).await.unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn verify_code_email_mismatch_returns_bad_request() {
+        // Test: valid code used with wrong email (prevents code theft)
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store.expect_get_verify_code().returning(|_| {
+            Ok(Some(VerifyState {
+                email: "alice@example.com".to_string(), // Code was requested for alice
+                code: "123456".to_string(),
+                created_at: Utc::now().timestamp(),
+            }))
+        });
+        // Note: delete is NOT called because email mismatch happens first
+
+        let state = TestStateBuilder::new()
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = VerifyCodePayload {
+            email: "attacker@example.com".to_string(), // Attacker tries to use alice's code
+            code: "123456".to_string(),
+        };
+
+        let result = verify_code(State(state), Json(payload)).await.unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn verify_code_rate_limited() {
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Exceeded(11)));
+
+        let state = TestStateBuilder::new()
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = VerifyCodePayload {
+            email: "alice@example.com".to_string(),
+            code: "123456".to_string(),
+        };
+
+        let result = verify_code(State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    // request_rotate tests
+
+    #[tokio::test]
+    async fn request_rotate_stores_and_sends_code() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store
+            .expect_store_rotate_code()
+            .returning(|_, _, _| Ok(()));
+
+        let mut email_sender = MockEmailSender::new();
+        email_sender
+            .expect_send_verification_code()
+            .returning(|_, _| Ok(()));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .with_email_sender(email_sender)
+            .build();
+
+        let result = request_rotate(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_rotate_rate_limited() {
+        let user_id = uuid::Uuid::new_v4();
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Exceeded(4)));
+
+        let state = TestStateBuilder::new()
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let result = request_rotate(AuthUser { id: user_id }, State(state)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_rotate_returns_not_found_for_missing_user() {
+        let user_id = uuid::Uuid::new_v4();
+
+        let mut user_repo = MockUserRepo::new();
+        user_repo.expect_find_by_id().returning(|_| Ok(None));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let result = request_rotate(AuthUser { id: user_id }, State(state)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    // verify_rotate tests
+
+    #[tokio::test]
+    async fn verify_rotate_issues_new_key() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+        let user_email = user.email.clone();
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+        user_repo.expect_update_key_id().returning(|_, _| Ok(()));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        let email_clone = user_email.clone();
+        verification_store
+            .expect_get_rotate_code()
+            .returning(move |_| {
+                Ok(Some(VerifyState {
+                    email: email_clone.clone(),
+                    code: "123456".to_string(),
+                    created_at: Utc::now().timestamp(),
+                }))
+            });
+        verification_store
+            .expect_delete_rotate_code()
+            .returning(|_| Ok(()));
+
+        let mut auth_service = MockAuthService::new();
+        auth_service.expect_delete_key().returning(|_| Ok(()));
+        auth_service.expect_create_key().returning(|_, _| {
+            Ok(CreateKeyResult {
+                key: "30s_new_key".to_string(),
+                key_id: "key_rotated".to_string(),
+            })
+        });
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .with_auth_service(auth_service)
+            .build();
+
+        let payload = RotateVerifyPayload {
+            code: "123456".to_string(),
+        };
+
+        let result = verify_rotate(AuthUser { id: user_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn verify_rotate_invalid_code_returns_bad_request() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store
+            .expect_get_rotate_code()
+            .returning(|_| Ok(None)); // Code not found
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = RotateVerifyPayload {
+            code: "999999".to_string(),
+        };
+
+        let result = verify_rotate(AuthUser { id: user_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_rotate_rate_limited() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Exceeded(11)));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = RotateVerifyPayload {
+            code: "123456".to_string(),
+        };
+
+        let result = verify_rotate(AuthUser { id: user_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_rotate_email_mismatch_returns_bad_request() {
+        let user = mock_user("alice@example.com");
+        let user_id = user.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_simple()
+            .returning(|_, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut verification_store = MockVerificationStore::new();
+        verification_store.expect_get_rotate_code().returning(|_| {
+            Ok(Some(VerifyState {
+                email: "different@example.com".to_string(), // Different email
+                code: "123456".to_string(),
+                created_at: Utc::now().timestamp(),
+            }))
+        });
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_verification_store(verification_store)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = RotateVerifyPayload {
+            code: "123456".to_string(),
+        };
+
+        let result = verify_rotate(AuthUser { id: user_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
 }

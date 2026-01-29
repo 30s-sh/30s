@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status\n        FROM workspaces WHERE id = $1\n        ",
+  "query": "\n            SELECT w.id, w.name, w.created_at, w.stripe_customer_id, w.stripe_subscription_id, w.subscription_status\n            FROM workspaces w\n            JOIN workspace_domains wd ON wd.workspace_id = w.id\n            WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL\n            AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')\n            ",
   "describe": {
     "columns": [
       {
@@ -36,7 +36,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "dce0ebab2d7b2af70d391cca360df63fb6be909df726783f65da92ad4697a5d5"
+  "hash": "5acc29c6c3f1fb35229d6c6472772b4cbb113d97ebfbd279285b20c553e8620f"
 }

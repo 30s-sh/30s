@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use crate::{api::Api, config::Config, credentials, ui};
 
+/// Delete a drop by ID.
 pub async fn run(config: &Config, id: &str) -> Result<()> {
     let api_key = credentials::get_api_key().await?;
 

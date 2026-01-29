@@ -80,7 +80,7 @@ fn validate_expires_at(value: &DateTime<Utc>, now: &DateTime<Utc>) -> garde::Res
 }
 
 /// A symmetric key wrapped (encrypted) for a specific recipient.
-#[derive(Debug, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[garde(context(DateTime<Utc>))]
 pub struct WrappedKeyPayload {
     /// Recipient's email address.
