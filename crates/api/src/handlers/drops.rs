@@ -199,15 +199,16 @@ async fn create_drop(
 
             // Check allow_external policy
             if p.allow_external == Some(false) {
-                let has_external = recipient_emails.iter().any(|email| {
-                    let recipient_domain = email.split('@').nth(1).unwrap_or("");
-                    !workspace_domains.iter().any(|d| d == recipient_domain)
-                });
-                if has_external {
-                    return Err(AppError::External(
-                        StatusCode::FORBIDDEN,
-                        "Workspace policy prohibits sending to external recipients",
-                    ));
+                for email in &recipient_emails {
+                    let recipient_domain = email.split('@').nth(1).ok_or_else(|| {
+                        AppError::Validation(format!("Invalid email format: {}", email))
+                    })?;
+                    if !workspace_domains.iter().any(|d| d == recipient_domain) {
+                        return Err(AppError::External(
+                            StatusCode::FORBIDDEN,
+                            "Workspace policy prohibits sending to external recipients",
+                        ));
+                    }
                 }
             }
 
@@ -239,10 +240,15 @@ async fn create_drop(
         }
 
         // Count external recipients (domains not in workspace)
+        // Note: Email format already validated above in allow_external check,
+        // but we still handle the case gracefully for non-policy paths
         let external_count = recipient_emails
             .iter()
             .filter(|email| {
-                let recipient_domain = email.split('@').nth(1).unwrap_or("");
+                let recipient_domain = match email.split('@').nth(1) {
+                    Some(domain) => domain,
+                    None => return true, // Treat invalid emails as external (will fail recipient lookup anyway)
+                };
                 !workspace_domains.iter().any(|d| d == recipient_domain)
             })
             .count();
