@@ -49,7 +49,7 @@ pub async fn spin<T, F: Future<Output = T>>(msg: &str, fut: F) -> T {
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.dim} {msg}")
-            .unwrap(),
+            .expect("hardcoded spinner template is valid"),
     );
     spinner.set_message(msg.to_string());
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
