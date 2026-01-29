@@ -33,7 +33,10 @@ impl Client {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await.unwrap_or_else(|e| {
+                tracing::warn!("failed to read Unkey error response body: {}", e);
+                String::new()
+            });
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: body,
@@ -69,7 +72,10 @@ impl Client {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await.unwrap_or_else(|e| {
+                tracing::warn!("failed to read Unkey error response body: {}", e);
+                String::new()
+            });
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: body,
@@ -97,7 +103,10 @@ impl Client {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await.unwrap_or_else(|e| {
+                tracing::warn!("failed to read Unkey error response body: {}", e);
+                String::new()
+            });
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: body,
