@@ -40,13 +40,13 @@ use axum::{
 use chrono::{Datelike, Months, TimeZone, Utc};
 use garde::Validate;
 use redis::AsyncCommands;
-use shared::api::{CreateDropPayload, CreateDropResponse, Drop, InboxItem};
+use shared::api::{AppliedPolicies, CreateDropPayload, CreateDropResponse, Drop, InboxItem};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
     middleware::auth::AuthUser,
-    models::{StoredDrop, User, Workspace},
+    models::{StoredDrop, User, Workspace, WorkspacePolicy},
     state::AppState,
 };
 
@@ -145,7 +145,17 @@ async fn create_drop(
         .map(|wk| wk.recipient_email.clone())
         .collect();
 
-    if let Some(workspace) = paid_workspace {
+    // Track applied policies for response
+    let mut applied_policies: Option<AppliedPolicies> = None;
+
+    // Calculate requested TTL in seconds
+    let requested_ttl = (payload.expires_at - now).num_seconds();
+
+    // Mutable copies for policy modifications
+    let mut effective_expires_at = payload.expires_at;
+    let mut effective_once = payload.once;
+
+    if let Some(ref workspace) = paid_workspace {
         // Paid workspace: unlimited internal, 50/month external
         // Get all verified domains for this workspace
         let workspace_domains: Vec<String> = sqlx::query_scalar!(
@@ -157,6 +167,76 @@ async fn create_drop(
         )
         .fetch_all(&state.database)
         .await?;
+
+        // Fetch workspace policies
+        let policy = sqlx::query_as!(
+            WorkspacePolicy,
+            "SELECT * FROM workspace_policies WHERE workspace_id = $1",
+            workspace.id
+        )
+        .fetch_optional(&state.database)
+        .await?;
+
+        // Apply policy validations and defaults
+        if let Some(ref p) = policy {
+            // Validate TTL against min/max
+            if let Some(min_ttl) = p.min_ttl_seconds
+                && requested_ttl < min_ttl as i64
+            {
+                return Err(AppError::External(
+                    StatusCode::BAD_REQUEST,
+                    "TTL below workspace minimum",
+                ));
+            }
+            if let Some(max_ttl) = p.max_ttl_seconds
+                && requested_ttl > max_ttl as i64
+            {
+                return Err(AppError::External(
+                    StatusCode::BAD_REQUEST,
+                    "TTL exceeds workspace maximum",
+                ));
+            }
+
+            // Check allow_external policy
+            if p.allow_external == Some(false) {
+                let has_external = recipient_emails.iter().any(|email| {
+                    let recipient_domain = email.split('@').nth(1).unwrap_or("");
+                    !workspace_domains.iter().any(|d| d == recipient_domain)
+                });
+                if has_external {
+                    return Err(AppError::External(
+                        StatusCode::FORBIDDEN,
+                        "Workspace policy prohibits sending to external recipients",
+                    ));
+                }
+            }
+
+            // Apply default TTL if user used the 30s default
+            if requested_ttl == 30
+                && let Some(default_ttl) = p.default_ttl_seconds
+            {
+                effective_expires_at = now + chrono::Duration::seconds(default_ttl as i64);
+                applied_policies = Some(AppliedPolicies {
+                    default_ttl_applied: Some(default_ttl),
+                    once_enforced: None,
+                });
+            }
+
+            // Apply require_once or default_once
+            if p.require_once == Some(true) && !payload.once {
+                effective_once = true;
+                applied_policies = Some(AppliedPolicies {
+                    default_ttl_applied: applied_policies.as_ref().and_then(|a| a.default_ttl_applied),
+                    once_enforced: Some(true),
+                });
+            } else if p.default_once == Some(true) && !payload.once {
+                effective_once = true;
+                applied_policies = Some(AppliedPolicies {
+                    default_ttl_applied: applied_policies.as_ref().and_then(|a| a.default_ttl_applied),
+                    once_enforced: Some(true),
+                });
+            }
+        }
 
         // Count external recipients (domains not in workspace)
         let external_count = recipient_emails
@@ -217,8 +297,8 @@ async fn create_drop(
     let drop_id = Uuid::new_v4();
     let created_at = Utc::now();
 
-    // Calculate TTL in seconds
-    let ttl = (payload.expires_at - created_at).num_seconds().max(0) as u64;
+    // Calculate TTL in seconds (using effective expiration which may be adjusted by policy)
+    let ttl = (effective_expires_at - created_at).num_seconds().max(0) as u64;
 
     // Store drop in Redis as JSON
     let stored_drop = StoredDrop {
@@ -229,7 +309,7 @@ async fn create_drop(
         aes_nonce: payload.aes_nonce,
         wrapped_keys: payload.wrapped_keys,
         created_at,
-        once: payload.once,
+        once: effective_once,
     };
 
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
@@ -243,7 +323,7 @@ async fn create_drop(
 
     // Add drop ID to each recipient's inbox. Using a sorted set with expiration
     // timestamp as the score allows efficient querying of non-expired drops.
-    let expiration_score = payload.expires_at.timestamp() as f64;
+    let expiration_score = effective_expires_at.timestamp() as f64;
     for user_id in &recipient_user_ids {
         let inbox_key = format!("inbox:{}", user_id);
         let _: () = redis
@@ -262,6 +342,7 @@ async fn create_drop(
         StatusCode::CREATED,
         Json(CreateDropResponse {
             id: drop_id.to_string(),
+            applied_policies,
         }),
     ))
 }

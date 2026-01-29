@@ -1,6 +1,9 @@
 //! Workspace management commands for domain verification.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use humantime::{format_duration, parse_duration};
+use shared::api::UpdatePoliciesPayload;
+use std::time::Duration;
 
 use crate::{api::Api, config::Config, credentials, ui};
 
@@ -133,4 +136,241 @@ pub async fn list_domains(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Display workspace policies.
+pub async fn policies(config: &Config) -> Result<()> {
+    let api_key = credentials::get_api_key().await?;
+    let api = Api::new(config.api_url.clone());
+
+    let policies = api.get_policies(api_key).await?;
+
+    println!("Workspace Policies:");
+    println!();
+
+    // TTL policies
+    match (policies.min_ttl_seconds, policies.max_ttl_seconds) {
+        (Some(min), Some(max)) => {
+            println!("  TTL range:      {} - {}", format_seconds(min), format_seconds(max));
+        }
+        (Some(min), None) => {
+            println!("  Minimum TTL:    {}", format_seconds(min));
+        }
+        (None, Some(max)) => {
+            println!("  Maximum TTL:    {}", format_seconds(max));
+        }
+        (None, None) => {
+            println!("  TTL range:      No restriction (global max: 24h)");
+        }
+    }
+
+    if let Some(default) = policies.default_ttl_seconds {
+        println!("  Default TTL:    {}", format_seconds(default));
+    } else {
+        println!("  Default TTL:    30s (CLI default)");
+    }
+
+    println!();
+
+    // Once policies
+    if policies.require_once == Some(true) {
+        println!("  Once:            Required");
+    } else if policies.default_once == Some(true) {
+        println!("  Once:            Default on");
+    } else {
+        println!("  Once:            Optional");
+    }
+
+    // External recipients
+    if policies.allow_external == Some(false) {
+        println!("  External sends:  Blocked");
+    } else {
+        println!("  External sends:  Allowed");
+    }
+
+    Ok(())
+}
+
+/// Set a workspace policy.
+pub async fn set_policy(config: &Config, key: &str, value: &str) -> Result<()> {
+    let api_key = credentials::get_api_key().await?;
+    let api = Api::new(config.api_url.clone());
+
+    // First get current policies so we only update the specified one
+    let current = api.get_policies(api_key.clone()).await?;
+
+    let payload = match key {
+        "max-ttl" => {
+            let seconds = parse_duration_to_seconds(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: Some(seconds),
+                min_ttl_seconds: current.min_ttl_seconds,
+                default_ttl_seconds: current.default_ttl_seconds,
+                require_once: current.require_once,
+                default_once: current.default_once,
+                allow_external: current.allow_external,
+            }
+        }
+        "min-ttl" => {
+            let seconds = parse_duration_to_seconds(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: current.max_ttl_seconds,
+                min_ttl_seconds: Some(seconds),
+                default_ttl_seconds: current.default_ttl_seconds,
+                require_once: current.require_once,
+                default_once: current.default_once,
+                allow_external: current.allow_external,
+            }
+        }
+        "default-ttl" => {
+            let seconds = parse_duration_to_seconds(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: current.max_ttl_seconds,
+                min_ttl_seconds: current.min_ttl_seconds,
+                default_ttl_seconds: Some(seconds),
+                require_once: current.require_once,
+                default_once: current.default_once,
+                allow_external: current.allow_external,
+            }
+        }
+        "require-once" => {
+            let enabled = parse_bool(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: current.max_ttl_seconds,
+                min_ttl_seconds: current.min_ttl_seconds,
+                default_ttl_seconds: current.default_ttl_seconds,
+                require_once: Some(enabled),
+                default_once: current.default_once,
+                allow_external: current.allow_external,
+            }
+        }
+        "default-once" => {
+            let enabled = parse_bool(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: current.max_ttl_seconds,
+                min_ttl_seconds: current.min_ttl_seconds,
+                default_ttl_seconds: current.default_ttl_seconds,
+                require_once: current.require_once,
+                default_once: Some(enabled),
+                allow_external: current.allow_external,
+            }
+        }
+        "allow-external" => {
+            let enabled = parse_bool(value)?;
+            UpdatePoliciesPayload {
+                max_ttl_seconds: current.max_ttl_seconds,
+                min_ttl_seconds: current.min_ttl_seconds,
+                default_ttl_seconds: current.default_ttl_seconds,
+                require_once: current.require_once,
+                default_once: current.default_once,
+                allow_external: Some(enabled),
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "Unknown policy key: {}. Valid keys: max-ttl, min-ttl, default-ttl, require-once, default-once, allow-external",
+                key
+            ));
+        }
+    };
+
+    api.update_policies(api_key, payload).await?;
+    ui::success(&format!("Policy '{}' set to '{}'", key, value));
+
+    Ok(())
+}
+
+/// Clear a workspace policy (set to NULL/unrestricted).
+pub async fn clear_policy(config: &Config, key: &str) -> Result<()> {
+    let api_key = credentials::get_api_key().await?;
+    let api = Api::new(config.api_url.clone());
+
+    // First get current policies so we only clear the specified one
+    let current = api.get_policies(api_key.clone()).await?;
+
+    let payload = match key {
+        "max-ttl" => UpdatePoliciesPayload {
+            max_ttl_seconds: None,
+            min_ttl_seconds: current.min_ttl_seconds,
+            default_ttl_seconds: current.default_ttl_seconds,
+            require_once: current.require_once,
+            default_once: current.default_once,
+            allow_external: current.allow_external,
+        },
+        "min-ttl" => UpdatePoliciesPayload {
+            max_ttl_seconds: current.max_ttl_seconds,
+            min_ttl_seconds: None,
+            default_ttl_seconds: current.default_ttl_seconds,
+            require_once: current.require_once,
+            default_once: current.default_once,
+            allow_external: current.allow_external,
+        },
+        "default-ttl" => UpdatePoliciesPayload {
+            max_ttl_seconds: current.max_ttl_seconds,
+            min_ttl_seconds: current.min_ttl_seconds,
+            default_ttl_seconds: None,
+            require_once: current.require_once,
+            default_once: current.default_once,
+            allow_external: current.allow_external,
+        },
+        "require-once" => UpdatePoliciesPayload {
+            max_ttl_seconds: current.max_ttl_seconds,
+            min_ttl_seconds: current.min_ttl_seconds,
+            default_ttl_seconds: current.default_ttl_seconds,
+            require_once: None,
+            default_once: current.default_once,
+            allow_external: current.allow_external,
+        },
+        "default-once" => UpdatePoliciesPayload {
+            max_ttl_seconds: current.max_ttl_seconds,
+            min_ttl_seconds: current.min_ttl_seconds,
+            default_ttl_seconds: current.default_ttl_seconds,
+            require_once: current.require_once,
+            default_once: None,
+            allow_external: current.allow_external,
+        },
+        "allow-external" => UpdatePoliciesPayload {
+            max_ttl_seconds: current.max_ttl_seconds,
+            min_ttl_seconds: current.min_ttl_seconds,
+            default_ttl_seconds: current.default_ttl_seconds,
+            require_once: current.require_once,
+            default_once: current.default_once,
+            allow_external: None,
+        },
+        _ => {
+            return Err(anyhow!(
+                "Unknown policy key: {}. Valid keys: max-ttl, min-ttl, default-ttl, require-once, default-once, allow-external",
+                key
+            ));
+        }
+    };
+
+    api.update_policies(api_key, payload).await?;
+    ui::success(&format!("Policy '{}' cleared", key));
+
+    Ok(())
+}
+
+/// Parse a duration string (e.g., "1h", "30m") to seconds.
+fn parse_duration_to_seconds(s: &str) -> Result<i32> {
+    let duration = parse_duration(s)?;
+    let seconds = duration.as_secs();
+    if seconds > i32::MAX as u64 {
+        return Err(anyhow!("Duration too large"));
+    }
+    Ok(seconds as i32)
+}
+
+/// Parse a boolean value from string.
+fn parse_bool(s: &str) -> Result<bool> {
+    match s.to_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Ok(true),
+        "false" | "no" | "0" | "off" => Ok(false),
+        _ => Err(anyhow!("Invalid boolean value: {}. Use true/false", s)),
+    }
+}
+
+/// Format seconds as a human-readable duration.
+fn format_seconds(seconds: i32) -> String {
+    format_duration(Duration::from_secs(seconds as u64)).to_string()
 }

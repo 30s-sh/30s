@@ -8,17 +8,19 @@
 //! 5. Send encrypted drop to API
 
 use std::io::{self, Read};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use crypto_box::SecretKey;
 use dialoguer::{Confirm, theme::ColorfulTheme};
-use humantime::parse_duration;
+use humantime::{format_duration, parse_duration};
 use owo_colors::OwoColorize;
 use shared::api::{CreateDropPayload, WrappedKeyPayload};
 use zeroize::Zeroize;
 
+use crate::known_keys::KeyCheckResult;
 use crate::{api::Api, config::Config, credentials, crypto, known_keys, ui};
 
 pub async fn run(
@@ -111,14 +113,14 @@ pub async fn run(
         };
 
         match known.check(email, fps) {
-            known_keys::KeyCheckResult::FirstContact => {
+            KeyCheckResult::FirstContact => {
                 // Silently pin all keys on first contact
                 known.pin_all(email, fps);
             }
-            known_keys::KeyCheckResult::Trusted => {
+            KeyCheckResult::Trusted => {
                 // All keys match - nothing to do
             }
-            known_keys::KeyCheckResult::NewKeys { new } => {
+            KeyCheckResult::NewKeys { new } => {
                 // New device keys detected - warn and prompt
                 eprintln!();
                 ui::warning(&format!("New device key(s) for {}", ui::bold(email)));
@@ -141,7 +143,7 @@ pub async fn run(
                 // Add the new keys
                 known.add_keys(email, &new);
             }
-            known_keys::KeyCheckResult::KeysMissing { missing } => {
+            KeyCheckResult::KeysMissing { missing } => {
                 // Previously pinned keys are missing - warn and prompt
                 eprintln!();
                 ui::warning(&format!("Missing device key(s) for {}", ui::bold(email)));
@@ -209,6 +211,19 @@ pub async fn run(
 
     ui::success(&format!("Sent! Drop ID: {}", ui::bold(&response.id)));
 
+    // Show applied workspace policies
+    if let Some(ref applied) = response.applied_policies {
+        if let Some(ttl) = applied.default_ttl_applied {
+            ui::info(&format!(
+                "Workspace default TTL applied: {}",
+                format_duration_seconds(ttl)
+            ));
+        }
+        if applied.once_enforced == Some(true) {
+            ui::info("Workspace policy: once enabled");
+        }
+    }
+
     // Display recipient fingerprints (one per email, show first)
     for email in recipients {
         if let Some(fps) = fingerprints_by_email.get(email)
@@ -224,4 +239,9 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Format seconds as a human-readable duration.
+fn format_duration_seconds(seconds: i32) -> String {
+    format_duration(Duration::from_secs(seconds as u64)).to_string()
 }
