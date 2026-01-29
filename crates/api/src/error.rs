@@ -3,6 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+#[derive(Debug)]
 pub enum AppError {
     /// Internal errors - logged but return generic 500 to user
     Internal(anyhow::Error),

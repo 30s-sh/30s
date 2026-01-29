@@ -27,7 +27,7 @@ use stripe::{
 use crate::{
     error::AppError,
     middleware::auth::AuthUser,
-    models::{Workspace, WorkspaceAdmin},
+    models::Workspace,
     state::AppState,
 };
 
@@ -94,31 +94,24 @@ fn verify_stripe_signature(
 
 /// Get the workspace the user is an admin of.
 async fn get_admin_workspace(state: &AppState, user_id: uuid::Uuid) -> Result<Workspace, AppError> {
-    let admin = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user_id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin = state
+        .repos
+        .workspaces
+        .find_admin_by_user(user_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::External(
+                StatusCode::FORBIDDEN,
+                "You must be a workspace admin to manage billing",
+            )
+        })?;
 
-    let admin = admin.ok_or_else(|| {
-        AppError::External(
-            StatusCode::FORBIDDEN,
-            "You must be a workspace admin to manage billing",
-        )
-    })?;
-
-    let workspace = sqlx::query_as!(
-        Workspace,
-        r#"
-        SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status
-        FROM workspaces WHERE id = $1
-        "#,
-        admin.workspace_id
-    )
-    .fetch_one(&state.database)
-    .await?;
+    let workspace = state
+        .repos
+        .workspaces
+        .find_by_id(admin.workspace_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Admin's workspace not found")))?;
 
     Ok(workspace)
 }
@@ -162,13 +155,11 @@ async fn create_checkout(
             .await?;
 
             // Save customer ID to database
-            sqlx::query!(
-                "UPDATE workspaces SET stripe_customer_id = $1 WHERE id = $2",
-                customer.id.as_str(),
-                workspace.id
-            )
-            .execute(&state.database)
-            .await?;
+            state
+                .repos
+                .workspaces
+                .set_stripe_customer(workspace.id, customer.id.as_str())
+                .await?;
 
             customer.id
         }
@@ -181,7 +172,7 @@ async fn create_checkout(
             customer: Some(customer_id.clone()),
             mode: Some(CheckoutSessionMode::Subscription),
             line_items: Some(vec![CreateCheckoutSessionLineItems {
-                price: Some(state.stripe_price_id.clone()),
+                price: Some(state.config.stripe_price_id.clone()),
                 quantity: Some(1),
                 ..Default::default()
             }]),
@@ -273,7 +264,7 @@ async fn handle_webhook(
         .map_err(|_| AppError::External(StatusCode::BAD_REQUEST, "Invalid payload encoding"))?;
 
     // Manually verify Stripe webhook signature (HMAC-SHA256)
-    verify_stripe_signature(payload, signature_header, &state.stripe_webhook_secret).map_err(
+    verify_stripe_signature(payload, signature_header, &state.config.stripe_webhook_secret).map_err(
         |e| {
             tracing::warn!("Webhook signature verification failed: {}", e);
             AppError::External(StatusCode::BAD_REQUEST, "Invalid webhook signature")
@@ -393,17 +384,11 @@ async fn handle_checkout_completed(
         return Ok(());
     };
 
-    sqlx::query!(
-        r#"
-        UPDATE workspaces
-        SET stripe_subscription_id = $1, subscription_status = 'active'
-        WHERE id = $2
-        "#,
-        sub_id,
-        workspace_id
-    )
-    .execute(&state.database)
-    .await?;
+    state
+        .repos
+        .workspaces
+        .set_subscription_active(workspace_id, sub_id)
+        .await?;
 
     tracing::info!(
         workspace_id = %workspace_id,
@@ -428,20 +413,13 @@ async fn handle_subscription_updated(
         _ => "none",
     };
 
-    let result = sqlx::query!(
-        r#"
-        UPDATE workspaces
-        SET stripe_subscription_id = $1, subscription_status = $2
-        WHERE stripe_customer_id = $3
-        "#,
-        subscription.id,
-        status,
-        subscription.customer
-    )
-    .execute(&state.database)
-    .await?;
+    let updated = state
+        .repos
+        .workspaces
+        .update_subscription_status(&subscription.customer, &subscription.id, status)
+        .await?;
 
-    if result.rows_affected() > 0 {
+    if updated {
         tracing::info!(
             customer_id = %subscription.customer,
             subscription_id = %subscription.id,
@@ -463,18 +441,13 @@ async fn handle_subscription_deleted(
     state: &AppState,
     subscription: &SubscriptionData,
 ) -> Result<(), AppError> {
-    let result = sqlx::query!(
-        r#"
-        UPDATE workspaces
-        SET stripe_subscription_id = NULL, subscription_status = 'none'
-        WHERE stripe_customer_id = $1
-        "#,
-        subscription.customer
-    )
-    .execute(&state.database)
-    .await?;
+    let updated = state
+        .repos
+        .workspaces
+        .clear_subscription(&subscription.customer)
+        .await?;
 
-    if result.rows_affected() > 0 {
+    if updated {
         tracing::info!(
             customer_id = %subscription.customer,
             subscription_id = %subscription.id,

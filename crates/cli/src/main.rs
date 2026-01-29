@@ -5,6 +5,8 @@ mod contacts;
 mod credentials;
 mod crypto;
 mod known_keys;
+#[cfg(test)]
+mod test;
 mod ui;
 mod version;
 

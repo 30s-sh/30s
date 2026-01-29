@@ -37,17 +37,16 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::{Datelike, Months, NaiveDate, Utc};
+use chrono::Utc;
 use garde::Validate;
-use redis::AsyncCommands;
 use shared::api::{AppliedPolicies, CreateDropPayload, CreateDropResponse, Drop, InboxItem};
 use uuid::Uuid;
 
 use crate::{
-    activity::{events, is_internal_send, log_activity},
     error::AppError,
     middleware::auth::AuthUser,
-    models::{StoredDrop, User, Workspace, WorkspacePolicy},
+    models::StoredDrop,
+    repos::{events, is_internal_send},
     state::AppState,
 };
 
@@ -56,43 +55,6 @@ pub fn router() -> Router<AppState> {
         .route("/create", post(create_drop))
         .route("/inbox", get(get_inbox))
         .route("/{id}", get(get_drop).delete(delete_drop))
-}
-
-/// Check and increment a rate limit counter.
-/// Returns an error if the limit is exceeded.
-async fn check_rate_limit(
-    redis: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-    limit: i64,
-    error_msg: &'static str,
-    now: chrono::DateTime<Utc>,
-) -> Result<(), AppError> {
-    let count: i64 = redis::cmd("INCR").arg(key).query_async(redis).await?;
-
-    if count == 1 {
-        // First request this month - set TTL to expire at start of next month
-        // Using NaiveDate is infallible for valid year/month/day=1 combinations
-        let next_month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
-            .expect("day 1 is always valid")
-            .checked_add_months(Months::new(1))
-            .expect("month arithmetic overflow")
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid")
-            .and_utc();
-        let ttl = (next_month_start - now).num_seconds();
-
-        let _: () = redis::cmd("EXPIRE")
-            .arg(key)
-            .arg(ttl)
-            .query_async(redis)
-            .await?;
-    }
-
-    if count > limit {
-        return Err(AppError::External(StatusCode::TOO_MANY_REQUESTS, error_msg));
-    }
-
-    Ok(())
 }
 
 #[debug_handler]
@@ -105,13 +67,15 @@ async fn create_drop(
         .validate_with(&Utc::now())
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
     let now = Utc::now();
 
     // Get sender's email for metadata and rate limiting
-    let sender = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let sender = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
     // Extract sender's email domain
     let sender_domain = sender
@@ -122,19 +86,7 @@ async fn create_drop(
         .to_string();
 
     // Check if sender belongs to a paid workspace
-    let paid_workspace = sqlx::query_as!(
-        Workspace,
-        r#"
-        SELECT w.*
-        FROM workspaces w
-        JOIN workspace_domains wd ON wd.workspace_id = w.id
-        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
-        AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
-        "#,
-        &sender_domain
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let paid_workspace = state.repos.workspaces.find_paid_by_domain(&sender_domain).await?;
 
     // Collect recipient emails
     let recipient_emails: Vec<String> = payload
@@ -159,27 +111,13 @@ async fn create_drop(
     if let Some(ref workspace) = paid_workspace {
         // Paid workspace: unlimited internal, 50/month external
         // Get all verified domains for this workspace
-        let domains: Vec<String> = sqlx::query_scalar!(
-            r#"
-            SELECT domain FROM workspace_domains
-            WHERE workspace_id = $1 AND verified_at IS NOT NULL
-            "#,
-            workspace.id
-        )
-        .fetch_all(&state.database)
-        .await?;
+        let domains = state.repos.workspaces.get_verified_domains(workspace.id).await?;
         workspace_domains = Some(domains);
         // Use the stored domains - safe because we just set it
         let domains = workspace_domains.as_ref().unwrap();
 
         // Fetch workspace policies
-        let policy = sqlx::query_as!(
-            WorkspacePolicy,
-            "SELECT * FROM workspace_policies WHERE workspace_id = $1",
-            workspace.id
-        )
-        .fetch_optional(&state.database)
-        .await?;
+        let policy = state.repos.workspaces.get_policy(workspace.id).await?;
 
         // Apply policy validations and defaults
         if let Some(ref p) = policy {
@@ -187,19 +125,21 @@ async fn create_drop(
             if let Some(min_ttl) = p.min_ttl_seconds
                 && requested_ttl < min_ttl as i64
             {
-                log_activity(
-                    &state.database,
-                    workspace.id,
-                    events::DROP_FAILED,
-                    user.id,
-                    None,
-                    serde_json::json!({
-                        "reason": "ttl_below_minimum",
-                        "requested_ttl": requested_ttl,
-                        "min_ttl": min_ttl,
-                    }),
-                )
-                .await;
+                state
+                    .repos
+                    .activity
+                    .log(
+                        workspace.id,
+                        events::DROP_FAILED,
+                        user.id,
+                        None,
+                        serde_json::json!({
+                            "reason": "ttl_below_minimum",
+                            "requested_ttl": requested_ttl,
+                            "min_ttl": min_ttl,
+                        }),
+                    )
+                    .await;
                 return Err(AppError::External(
                     StatusCode::BAD_REQUEST,
                     "TTL below workspace minimum",
@@ -208,19 +148,21 @@ async fn create_drop(
             if let Some(max_ttl) = p.max_ttl_seconds
                 && requested_ttl > max_ttl as i64
             {
-                log_activity(
-                    &state.database,
-                    workspace.id,
-                    events::DROP_FAILED,
-                    user.id,
-                    None,
-                    serde_json::json!({
-                        "reason": "ttl_exceeds_maximum",
-                        "requested_ttl": requested_ttl,
-                        "max_ttl": max_ttl,
-                    }),
-                )
-                .await;
+                state
+                    .repos
+                    .activity
+                    .log(
+                        workspace.id,
+                        events::DROP_FAILED,
+                        user.id,
+                        None,
+                        serde_json::json!({
+                            "reason": "ttl_exceeds_maximum",
+                            "requested_ttl": requested_ttl,
+                            "max_ttl": max_ttl,
+                        }),
+                    )
+                    .await;
                 return Err(AppError::External(
                     StatusCode::BAD_REQUEST,
                     "TTL exceeds workspace maximum",
@@ -234,18 +176,20 @@ async fn create_drop(
                         AppError::Validation(format!("Invalid email format: {}", email))
                     })?;
                     if !domains.iter().any(|d| d == recipient_domain) {
-                        log_activity(
-                            &state.database,
-                            workspace.id,
-                            events::DROP_FAILED,
-                            user.id,
-                            None,
-                            serde_json::json!({
-                                "reason": "external_recipients_blocked",
-                                "recipient_count": recipient_emails.len(),
-                            }),
-                        )
-                        .await;
+                        state
+                            .repos
+                            .activity
+                            .log(
+                                workspace.id,
+                                events::DROP_FAILED,
+                                user.id,
+                                None,
+                                serde_json::json!({
+                                    "reason": "external_recipients_blocked",
+                                    "recipient_count": recipient_emails.len(),
+                                }),
+                            )
+                            .await;
                         return Err(AppError::External(
                             StatusCode::FORBIDDEN,
                             "Workspace policy prohibits sending to external recipients",
@@ -301,54 +245,53 @@ async fn create_drop(
 
         if external_count > 0 {
             // Apply external rate limit
-            if let Err(e) = check_rate_limit(
-                &mut redis,
-                &format!("ratelimit:drops:external:{}:{}", user.id, now.format("%Y-%m")),
-                50,
-                "Monthly external recipient limit exceeded (50/month). Internal sends are unlimited.",
-                now,
-            )
-            .await
-            {
-                log_activity(
-                    &state.database,
-                    workspace.id,
-                    events::DROP_FAILED,
-                    user.id,
-                    None,
-                    serde_json::json!({
-                        "reason": "external_rate_limit_exceeded",
-                        "external_count": external_count,
-                    }),
-                )
-                .await;
-                return Err(e);
+            let result = state
+                .stores
+                .rate_limiter
+                .check_monthly("ratelimit:drops:external", &user.id.to_string(), 50, now)
+                .await?;
+            if !result.is_allowed() {
+                state
+                    .repos
+                    .activity
+                    .log(
+                        workspace.id,
+                        events::DROP_FAILED,
+                        user.id,
+                        None,
+                        serde_json::json!({
+                            "reason": "external_rate_limit_exceeded",
+                            "external_count": external_count,
+                        }),
+                    )
+                    .await;
+                return Err(AppError::External(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Monthly external recipient limit exceeded (50/month). Internal sends are unlimited.",
+                ));
             }
         }
         // If all recipients are internal, no rate limit applies
     } else {
         // Free tier: 50 sends/month total (no workspace to log to)
-        check_rate_limit(
-            &mut redis,
-            &format!("ratelimit:drops:{}:{}", user.id, now.format("%Y-%m")),
-            50,
-            "Monthly limit exceeded (50 drops/month)",
-            now,
-        )
-        .await?;
+        let result = state
+            .stores
+            .rate_limiter
+            .check_monthly("ratelimit:drops", &user.id.to_string(), 50, now)
+            .await?;
+        if !result.is_allowed() {
+            return Err(AppError::External(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Monthly limit exceeded (50 drops/month)",
+            ));
+        }
     }
 
     // Verify all recipients exist and are verified, and collect their user IDs.
     // This catches typos early and prevents sending secrets to non-existent users.
     let mut recipient_user_ids: Vec<Uuid> = Vec::with_capacity(recipient_emails.len());
     for email in &recipient_emails {
-        let recipient = sqlx::query_as!(
-            User,
-            "SELECT * FROM users WHERE email = $1 AND verified_at IS NOT NULL",
-            email
-        )
-        .fetch_optional(&state.database)
-        .await?;
+        let recipient = state.repos.users.find_verified_by_email(email).await?;
 
         match recipient {
             Some(user) => recipient_user_ids.push(user.id),
@@ -379,21 +322,17 @@ async fn create_drop(
         once: effective_once,
     };
 
-    let drop_key = format!("drop:{}", drop_id);
-
     // Store the drop with TTL
-    let _: () = redis
-        .set(&drop_key, serde_json::to_string(&stored_drop)?)
-        .await?;
-    let _: () = redis.expire(&drop_key, ttl as i64).await?;
+    state.stores.drops.store(&stored_drop, ttl).await?;
 
     // Add drop ID to each recipient's inbox. Using a sorted set with expiration
     // timestamp as the score allows efficient querying of non-expired drops.
     let expiration_score = effective_expires_at.timestamp() as f64;
     for user_id in &recipient_user_ids {
-        let inbox_key = format!("inbox:{}", user_id);
-        let _: () = redis
-            .zadd(&inbox_key, drop_id.to_string(), expiration_score)
+        state
+            .stores
+            .inbox
+            .add(*user_id, &drop_id.to_string(), expiration_score)
             .await?;
     }
 
@@ -410,19 +349,21 @@ async fn create_drop(
         let domains = workspace_domains.as_ref().unwrap();
         let is_internal = is_internal_send(&recipient_emails, domains);
 
-        log_activity(
-            &state.database,
-            workspace.id,
-            events::DROP_SENT,
-            user.id,
-            Some(drop_id),
-            serde_json::json!({
-                "recipient_count": recipient_emails.len(),
-                "internal": is_internal,
-                "once": effective_once,
-            }),
-        )
-        .await;
+        state
+            .repos
+            .activity
+            .log(
+                workspace.id,
+                events::DROP_SENT,
+                user.id,
+                Some(drop_id),
+                serde_json::json!({
+                    "recipient_count": recipient_emails.len(),
+                    "internal": is_internal,
+                    "once": effective_once,
+                }),
+            )
+            .await;
     }
 
     Ok((
@@ -439,34 +380,21 @@ async fn get_inbox(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let inbox_key = format!("inbox:{}", user.id);
     let now = Utc::now().timestamp() as f64;
 
     // Clean up expired entries (score < now) on each inbox access.
     // This prevents unbounded growth of stale entries over time.
-    let _: () = redis
-        .zrembyscore(&inbox_key, f64::NEG_INFINITY, now)
-        .await
-        .unwrap_or_default();
+    state.stores.inbox.cleanup_expired(user.id, now).await?;
 
     // Query inbox sorted set for drops with expiration >= now.
-    let drop_ids: Vec<String> = redis
-        .zrangebyscore(&inbox_key, now, f64::MAX)
-        .await
-        .unwrap_or_default();
+    let drop_ids = state.stores.inbox.get_active(user.id, now).await?;
 
     let mut items = Vec::new();
 
     // Fetch full drop data for each ID. Drops that expired (TTL hit) will return None
     // and are silently skipped (lazy cleanup - inbox entries are stale but harmless).
     for drop_id in drop_ids {
-        let drop_key = format!("drop:{}", drop_id);
-        let drop_json: Option<String> = redis.get(&drop_key).await?;
-
-        if let Some(json) = drop_json
-            && let Ok(drop) = serde_json::from_str::<StoredDrop>(&json)
-        {
+        if let Some(drop) = state.stores.drops.get(&drop_id).await? {
             items.push(InboxItem {
                 id: drop_id,
                 sender_email: drop.sender_email,
@@ -484,19 +412,19 @@ async fn get_drop(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let recipient = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
+    let recipient = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let drop_key = format!("drop:{}", id);
-
-    let drop_json: Option<String> = redis.get(&drop_key).await?;
-
-    let drop_json =
-        drop_json.ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "Drop not found"))?;
-
-    let stored_drop: StoredDrop = serde_json::from_str(&drop_json)?;
+    let stored_drop = state
+        .stores
+        .drops
+        .get(&id.to_string())
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "Drop not found"))?;
 
     // Verify this user is a recipient. Prevents unauthorized access even if
     // someone guesses or intercepts a drop ID.
@@ -522,52 +450,41 @@ async fn get_drop(
         .nth(1)
         .unwrap_or_default();
 
-    if let Some(sender_workspace) = sqlx::query_as!(
-        Workspace,
-        r#"
-        SELECT w.*
-        FROM workspaces w
-        JOIN workspace_domains wd ON wd.workspace_id = w.id
-        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
-        AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
-        "#,
-        sender_domain
-    )
-    .fetch_optional(&state.database)
-    .await
-    .ok()
-    .flatten()
+    if let Ok(Some(sender_workspace)) = state
+        .repos
+        .workspaces
+        .find_paid_by_domain(sender_domain)
+        .await
     {
-        log_activity(
-            &state.database,
-            sender_workspace.id,
-            events::DROP_OPENED,
-            user.id,
-            Some(id),
-            serde_json::json!({
-                "sender_email": stored_drop.sender_email,
-            }),
-        )
-        .await;
+        state
+            .repos
+            .activity
+            .log(
+                sender_workspace.id,
+                events::DROP_OPENED,
+                user.id,
+                Some(id),
+                serde_json::json!({
+                    "sender_email": stored_drop.sender_email,
+                }),
+            )
+            .await;
     }
 
     // If burn-after-reading is enabled, delete the drop after retrieval
     if stored_drop.once {
         // Delete the drop from Redis
-        let _: () = redis.del(&drop_key).await?;
+        state.stores.drops.delete(&id.to_string()).await?;
 
         // Remove from all recipients' inboxes
         for wk in &stored_drop.wrapped_keys {
-            if let Some(recipient_user) = sqlx::query_as!(
-                User,
-                "SELECT * FROM users WHERE email = $1",
-                wk.recipient_email
-            )
-            .fetch_optional(&state.database)
-            .await?
+            if let Some(recipient_user) = state.repos.users.find_by_email(&wk.recipient_email).await?
             {
-                let inbox_key = format!("inbox:{}", recipient_user.id);
-                let _: () = redis.zrem(&inbox_key, id.to_string()).await?;
+                state
+                    .stores
+                    .inbox
+                    .remove(recipient_user.id, &id.to_string())
+                    .await?;
             }
         }
 
@@ -597,19 +514,17 @@ async fn delete_drop(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let sender = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user.id)
-        .fetch_one(&state.database)
-        .await?;
-
-    let mut redis = state.redis.get_multiplexed_async_connection().await?;
-    let drop_key = format!("drop:{}", id);
+    let sender = state
+        .repos
+        .users
+        .find_by_id(user.id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
 
     // Check if drop exists and verify ownership before deleting
-    let drop_json: Option<String> = redis.get(&drop_key).await?;
+    let stored_drop = state.stores.drops.get(&id.to_string()).await?;
 
-    if let Some(json) = drop_json {
-        let stored_drop: StoredDrop = serde_json::from_str(&json)?;
-
+    if let Some(stored_drop) = stored_drop {
         // Only the sender can delete their own drops
         if stored_drop.sender_email != sender.email {
             return Err(AppError::External(
@@ -619,20 +534,16 @@ async fn delete_drop(
         }
 
         // Delete the drop
-        let _: () = redis.del(&drop_key).await?;
+        state.stores.drops.delete(&id.to_string()).await?;
 
         // Remove from all recipients' inboxes (look up user IDs from emails)
         for wk in &stored_drop.wrapped_keys {
-            if let Some(recipient) = sqlx::query_as!(
-                User,
-                "SELECT * FROM users WHERE email = $1",
-                wk.recipient_email
-            )
-            .fetch_optional(&state.database)
-            .await?
-            {
-                let inbox_key = format!("inbox:{}", recipient.id);
-                let _: () = redis.zrem(&inbox_key, id.to_string()).await?;
+            if let Some(recipient) = state.repos.users.find_by_email(&wk.recipient_email).await? {
+                state
+                    .stores
+                    .inbox
+                    .remove(recipient.id, &id.to_string())
+                    .await?;
             }
         }
 
@@ -645,37 +556,928 @@ async fn delete_drop(
             .nth(1)
             .unwrap_or_default();
 
-        if let Some(workspace) = sqlx::query_as!(
-            Workspace,
-            r#"
-            SELECT w.*
-            FROM workspaces w
-            JOIN workspace_domains wd ON wd.workspace_id = w.id
-            WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
-            AND (w.subscription_status = 'active' OR w.subscription_status = 'past_due')
-            "#,
-            sender_domain
-        )
-        .fetch_optional(&state.database)
-        .await
-        .ok()
-        .flatten()
+        if let Ok(Some(workspace)) = state
+            .repos
+            .workspaces
+            .find_paid_by_domain(sender_domain)
+            .await
         {
             let recipient_count = stored_drop.wrapped_keys.len();
-            log_activity(
-                &state.database,
-                workspace.id,
-                events::DROP_DELETED,
-                user.id,
-                Some(id),
-                serde_json::json!({
-                    "recipient_count": recipient_count,
-                }),
-            )
-            .await;
+            state
+                .repos
+                .activity
+                .log(
+                    workspace.id,
+                    events::DROP_DELETED,
+                    user.id,
+                    Some(id),
+                    serde_json::json!({
+                        "recipient_count": recipient_count,
+                    }),
+                )
+                .await;
         }
     }
 
     // Return success even if drop didn't exist (idempotent)
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repos::{MockActivityRepo, MockUserRepo, MockWorkspaceRepo};
+    use crate::stores::{MockDropStore, MockInboxStore, MockRateLimiter, RateLimitResult};
+    use crate::test_utils::{
+        mock_policy, mock_stored_drop, mock_user, mock_workspace, TestStateBuilder,
+    };
+    use axum::http::StatusCode;
+    use shared::api::WrappedKeyPayload;
+
+    #[tokio::test]
+    async fn get_inbox_returns_empty_when_no_drops() {
+        let user_id = Uuid::new_v4();
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store
+            .expect_cleanup_expired()
+            .returning(|_, _| Ok(()));
+        inbox_store
+            .expect_get_active()
+            .returning(|_, _| Ok(vec![]));
+
+        let state = TestStateBuilder::new()
+            .with_inbox_store(inbox_store)
+            .build();
+
+        let result = get_inbox(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_inbox_returns_drops_for_user() {
+        let user_id = Uuid::new_v4();
+        let drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        let drop_id = drop.id.clone();
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store
+            .expect_cleanup_expired()
+            .returning(|_, _| Ok(()));
+        inbox_store
+            .expect_get_active()
+            .returning(move |_, _| Ok(vec![drop_id.clone()]));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+
+        let state = TestStateBuilder::new()
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .build();
+
+        let result = get_inbox(AuthUser { id: user_id }, State(state))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_drop_returns_drop_for_recipient() {
+        let recipient = mock_user("recipient@example.com");
+        let recipient_id = recipient.id;
+        let drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_workspace_repo(workspace_repo)
+            .build();
+
+        let result = get_drop(AuthUser { id: recipient_id }, State(state), Path(drop_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_drop_returns_forbidden_for_non_recipient() {
+        let non_recipient = mock_user("other@example.com");
+        let non_recipient_id = non_recipient.id;
+        let drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = non_recipient.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .build();
+
+        let result = get_drop(
+            AuthUser {
+                id: non_recipient_id,
+            },
+            State(state),
+            Path(drop_id),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_drop_returns_not_found_for_missing_drop() {
+        let user = mock_user("recipient@example.com");
+        let user_id = user.id;
+        let drop_id = Uuid::new_v4();
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_get().returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .build();
+
+        let result = get_drop(AuthUser { id: user_id }, State(state), Path(drop_id)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_drop_returns_ok_for_sender() {
+        let sender = mock_user("sender@example.com");
+        let sender_id = sender.id;
+        let drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        user_repo.expect_find_by_email().returning(|_| Ok(None));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+        drop_store.expect_delete().returning(|_| Ok(true));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_remove().returning(|_, _| Ok(()));
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_workspace_repo(workspace_repo)
+            .build();
+
+        let result = delete_drop(AuthUser { id: sender_id }, State(state), Path(drop_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_drop_returns_forbidden_for_non_sender() {
+        let non_sender = mock_user("other@example.com");
+        let non_sender_id = non_sender.id;
+        let drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = non_sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .build();
+
+        let result = delete_drop(
+            AuthUser {
+                id: non_sender_id,
+            },
+            State(state),
+            Path(drop_id),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+            _ => panic!("Expected External error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_drop_returns_ok_even_when_not_found() {
+        let user = mock_user("sender@example.com");
+        let user_id = user.id;
+        let drop_id = Uuid::new_v4();
+
+        let mut user_repo = MockUserRepo::new();
+        let user_clone = user.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(user_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_get().returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .build();
+
+        let result = delete_drop(AuthUser { id: user_id }, State(state), Path(drop_id))
+            .await
+            .unwrap();
+
+        // Idempotent - returns OK even when drop doesn't exist
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_drop_with_once_flag_deletes_after_read() {
+        let recipient = mock_user("recipient@example.com");
+        let recipient_id = recipient.id;
+        let mut drop = mock_stored_drop("sender@example.com", "recipient@example.com");
+        drop.once = true; // Burn-after-reading
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+        user_repo.expect_find_by_email().returning(|_| Ok(None));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+        drop_store
+            .expect_delete()
+            .times(1)
+            .returning(|_| Ok(true));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_remove().returning(|_, _| Ok(()));
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_workspace_repo(workspace_repo)
+            .build();
+
+        let result = get_drop(AuthUser { id: recipient_id }, State(state), Path(drop_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // create_drop tests
+
+    fn mock_create_drop_payload(recipient_email: &str) -> CreateDropPayload {
+        CreateDropPayload {
+            sender_public_key: "sender-pubkey-base64".to_string(),
+            ciphertext: "encrypted-data-base64".to_string(),
+            aes_nonce: "nonce-base64".to_string(),
+            wrapped_keys: vec![WrappedKeyPayload {
+                recipient_email: recipient_email.to_string(),
+                nonce: "wrap-nonce".to_string(),
+                wrapped_key: "wrapped-aes-key".to_string(),
+            }],
+            expires_at: Utc::now() + chrono::Duration::seconds(30),
+            once: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_returns_rate_limited_for_free_tier() {
+        let sender = mock_user("sender@example.com");
+        let sender_id = sender.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None)); // Free tier
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_monthly()
+            .returning(|_, _, _, _| Ok(RateLimitResult::Exceeded(51)));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_workspace_repo(workspace_repo)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = mock_create_drop_payload("recipient@example.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert!(msg.contains("50 drops/month"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_returns_bad_request_for_missing_recipient() {
+        let sender = mock_user("sender@example.com");
+        let sender_id = sender.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(|_| Ok(None)); // Recipient not found
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_monthly()
+            .returning(|_, _, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_workspace_repo(workspace_repo)
+            .with_rate_limiter(rate_limiter)
+            .build();
+
+        let payload = mock_create_drop_payload("nonexistent@example.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(msg.contains("recipients not found"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_succeeds_for_free_tier() {
+        let sender = mock_user("sender@example.com");
+        let sender_id = sender.id;
+        let recipient = mock_user("recipient@example.com");
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_monthly()
+            .returning(|_, _, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_store().returning(|_, _| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_add().returning(|_, _, _| Ok(()));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_rate_limiter(rate_limiter)
+            .with_workspace_repo(workspace_repo)
+            .build();
+
+        let payload = mock_create_drop_payload("recipient@example.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_drop_returns_validation_error_for_expired_timestamp() {
+        let sender = mock_user("sender@example.com");
+        let sender_id = sender.id;
+
+        let state = TestStateBuilder::new().build();
+
+        let mut payload = mock_create_drop_payload("recipient@example.com");
+        payload.expires_at = Utc::now() - chrono::Duration::seconds(60); // Past timestamp
+
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("expires_at"));
+            }
+            _ => panic!("Expected Validation error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_returns_not_found_when_sender_missing() {
+        let sender_id = Uuid::new_v4();
+
+        let mut user_repo = MockUserRepo::new();
+        user_repo.expect_find_by_id().returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .build();
+
+        let payload = mock_create_drop_payload("recipient@example.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    // Workspace policy tests
+
+    #[tokio::test]
+    async fn create_drop_rejects_ttl_below_minimum() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+
+        // Policy with min_ttl of 60 seconds
+        let mut policy = mock_policy(workspace_id);
+        policy.min_ttl_seconds = Some(60);
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(policy.clone())));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Payload with 30s TTL (below 60s minimum)
+        let payload = mock_create_drop_payload("recipient@acme.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(msg.contains("below workspace minimum"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_rejects_ttl_above_maximum() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+
+        // Policy with max_ttl of 60 seconds
+        let mut policy = mock_policy(workspace_id);
+        policy.max_ttl_seconds = Some(60);
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(policy.clone())));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Payload with 2 hour TTL (above 60s maximum)
+        let mut payload = mock_create_drop_payload("recipient@acme.com");
+        payload.expires_at = Utc::now() + chrono::Duration::hours(2);
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(msg.contains("exceeds workspace maximum"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_blocks_external_recipients_when_policy_forbids() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+
+        // Policy forbids external recipients
+        let mut policy = mock_policy(workspace_id);
+        policy.allow_external = Some(false);
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(policy.clone())));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Try to send to external recipient (different domain)
+        let payload = mock_create_drop_payload("recipient@external.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(msg.contains("external recipients"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_enforces_require_once_policy() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let recipient = mock_user("recipient@acme.com");
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+
+        // Policy requires once (burn-after-reading)
+        let mut policy = mock_policy(workspace_id);
+        policy.require_once = Some(true);
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(policy.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        // Verify that the drop is stored with once=true
+        drop_store
+            .expect_store()
+            .withf(|drop, _| drop.once)
+            .returning(|_, _| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_add().returning(|_, _, _| Ok(()));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Payload explicitly sets once=false, but policy should override
+        let mut payload = mock_create_drop_payload("recipient@acme.com");
+        payload.once = false;
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_drop_rate_limits_external_recipients_for_paid_workspace() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(mock_policy(workspace_id))));
+
+        // External rate limit exceeded (50/month for external)
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_monthly()
+            .returning(|_, _, _, _| Ok(RateLimitResult::Exceeded(51)));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_rate_limiter(rate_limiter)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Send to external recipient
+        let payload = mock_create_drop_payload("recipient@external.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, msg) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert!(msg.contains("external recipient limit"));
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_allows_unlimited_internal_for_paid_workspace() {
+        let sender = mock_user("sender@acme.com");
+        let sender_id = sender.id;
+        let recipient = mock_user("recipient@acme.com");
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(mock_policy(workspace_id))));
+
+        // No rate limiter expectations - internal sends should NOT check rate limit
+        let rate_limiter = MockRateLimiter::new();
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_store().returning(|_, _| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_add().returning(|_, _, _| Ok(()));
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo.expect_log().returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_rate_limiter(rate_limiter)
+            .with_workspace_repo(workspace_repo)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        // Send to internal recipient (same domain)
+        let payload = mock_create_drop_payload("recipient@acme.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
 }

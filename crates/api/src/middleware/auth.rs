@@ -43,8 +43,8 @@ impl FromRequestParts<AppState> for AuthUser {
 
         let api_key = bearer.token();
 
-        let result = state.unkey.verify_key(api_key).await.map_err(|e| {
-            tracing::error!("Unkey verification error: {:?}", e);
+        let result = state.auth.verify_key(api_key).await.map_err(|e| {
+            tracing::error!("Auth verification error: {:?}", e);
             AuthError::InvalidToken
         })?;
 
@@ -52,7 +52,7 @@ impl FromRequestParts<AppState> for AuthUser {
             return Err(AuthError::InvalidToken);
         }
 
-        let id = result.identity.ok_or(AuthError::InvalidToken)?.external_id;
+        let id = result.user_id.ok_or(AuthError::InvalidToken)?;
 
         Ok(AuthUser {
             id: Uuid::parse_str(&id).map_err(|_| AuthError::InvalidToken)?,

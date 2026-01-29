@@ -12,13 +12,12 @@ use shared::api::{
     AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo, UpdatePoliciesPayload,
     VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
 };
-use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
     middleware::auth::AuthUser,
-    models::{User, Workspace, WorkspaceAdmin, WorkspaceDomain, WorkspacePolicy},
+    models::WorkspacePolicy,
     state::AppState,
 };
 
@@ -44,10 +43,13 @@ fn extract_email_domain(email: &str) -> Result<&str, AppError> {
 }
 
 /// Fetch a user by ID and return their email domain.
-async fn get_user_email_domain(db: &Pool<Postgres>, user_id: Uuid) -> Result<String, AppError> {
-    let user = sqlx::query_as!(User, "SELECT * FROM users WHERE id = $1", user_id)
-        .fetch_one(db)
-        .await?;
+async fn get_user_email_domain(state: &AppState, user_id: Uuid) -> Result<String, AppError> {
+    let user = state
+        .repos
+        .users
+        .find_by_id(user_id)
+        .await?
+        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
     extract_email_domain(&user.email).map(|s| s.to_string())
 }
 
@@ -68,22 +70,15 @@ async fn get_workspace(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // First check if user is an admin of any workspace
-    let admin_workspace = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin_workspace = state.repos.workspaces.find_admin_by_user(user.id).await?;
 
     if let Some(admin) = admin_workspace {
-        let workspace = sqlx::query_as!(
-            Workspace,
-            "SELECT * FROM workspaces WHERE id = $1",
-            admin.workspace_id
-        )
-        .fetch_one(&state.database)
-        .await?;
+        let workspace = state
+            .repos
+            .workspaces
+            .find_by_id(admin.workspace_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Workspace not found")))?;
 
         let is_paid = workspace.has_active_subscription();
         return Ok(Json(WorkspaceInfo {
@@ -96,20 +91,13 @@ async fn get_workspace(
     }
 
     // Otherwise, find a verified domain that matches the user's email domain
-    let email_domain = get_user_email_domain(&state.database, user.id).await?;
+    let email_domain = get_user_email_domain(&state, user.id).await?;
 
-    let workspace = sqlx::query_as!(
-        Workspace,
-        r#"
-        SELECT w.*
-        FROM workspaces w
-        JOIN workspace_domains wd ON wd.workspace_id = w.id
-        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
-        "#,
-        &email_domain
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let workspace = state
+        .repos
+        .workspaces
+        .find_by_verified_domain(&email_domain)
+        .await?;
 
     match workspace {
         Some(w) => {
@@ -141,13 +129,7 @@ async fn create_workspace(
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Check if user is already an admin of a workspace
-    let existing_admin = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let existing_admin = state.repos.workspaces.find_admin_by_user(user.id).await?;
 
     if existing_admin.is_some() {
         return Err(AppError::External(
@@ -156,26 +138,12 @@ async fn create_workspace(
         ));
     }
 
-    // Create workspace and add user as admin in a transaction
-    let mut tx = state.database.begin().await?;
-
-    let workspace = sqlx::query_as!(
-        Workspace,
-        "INSERT INTO workspaces (name) VALUES ($1) RETURNING *",
-        payload.name
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    sqlx::query!(
-        "INSERT INTO workspace_admins (workspace_id, user_id) VALUES ($1, $2)",
-        workspace.id,
-        user.id
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
+    // Create workspace and add user as admin
+    let workspace = state
+        .repos
+        .workspaces
+        .create_with_admin(&payload.name, user.id)
+        .await?;
 
     tracing::info!(
         workspace_id = %workspace.id,
@@ -215,7 +183,7 @@ async fn add_domain(
     }
 
     // Verify user's email matches the domain they're trying to add
-    let email_domain = get_user_email_domain(&state.database, user.id).await?;
+    let email_domain = get_user_email_domain(&state, user.id).await?;
     if email_domain != domain {
         return Err(AppError::External(
             StatusCode::FORBIDDEN,
@@ -224,13 +192,7 @@ async fn add_domain(
     }
 
     // Check if user is an admin of a workspace
-    let admin = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin = state.repos.workspaces.find_admin_by_user(user.id).await?;
 
     let workspace_id = match admin {
         Some(a) => a.workspace_id,
@@ -243,13 +205,7 @@ async fn add_domain(
     };
 
     // Check if domain already exists
-    let existing = sqlx::query_as!(
-        WorkspaceDomain,
-        "SELECT * FROM workspace_domains WHERE domain = $1",
-        domain
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let existing = state.repos.workspaces.find_domain(&domain).await?;
 
     if let Some(existing) = existing {
         if existing.verified_at.is_some() {
@@ -270,17 +226,11 @@ async fn add_domain(
     let token = hex::encode(token_bytes);
 
     // Insert the domain linked to the workspace
-    sqlx::query!(
-        r#"
-        INSERT INTO workspace_domains (workspace_id, domain, verification_token)
-        VALUES ($1, $2, $3)
-        "#,
-        workspace_id,
-        domain,
-        token
-    )
-    .execute(&state.database)
-    .await?;
+    state
+        .repos
+        .workspaces
+        .add_domain(workspace_id, &domain, &token)
+        .await?;
 
     let txt_host = txt_record_host(&domain);
     let txt_value = txt_record_value(&token);
@@ -306,7 +256,7 @@ async fn verify_domain(
     let domain = domain.to_lowercase();
 
     // Verify user's email matches the domain they're trying to verify
-    let email_domain = get_user_email_domain(&state.database, user.id).await?;
+    let email_domain = get_user_email_domain(&state, user.id).await?;
     if email_domain != domain {
         return Err(AppError::External(
             StatusCode::FORBIDDEN,
@@ -315,13 +265,7 @@ async fn verify_domain(
     }
 
     // Get the pending domain verification
-    let pending = sqlx::query_as!(
-        WorkspaceDomain,
-        "SELECT * FROM workspace_domains WHERE domain = $1",
-        domain
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let pending = state.repos.workspaces.find_domain(&domain).await?;
 
     let pending = match pending {
         Some(p) => p,
@@ -345,13 +289,12 @@ async fn verify_domain(
         .workspace_id
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Domain not linked to a workspace")))?;
 
-    let workspace = sqlx::query_as!(
-        Workspace,
-        "SELECT * FROM workspaces WHERE id = $1",
-        workspace_id
-    )
-    .fetch_one(&state.database)
-    .await?;
+    let workspace = state
+        .repos
+        .workspaces
+        .find_by_id(workspace_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Workspace not found")))?;
 
     // Check if workspace has active subscription
     if !workspace.has_active_subscription() {
@@ -389,12 +332,7 @@ async fn verify_domain(
     }
 
     // Mark domain as verified
-    sqlx::query!(
-        "UPDATE workspace_domains SET verified_at = NOW() WHERE domain = $1",
-        domain
-    )
-    .execute(&state.database)
-    .await?;
+    state.repos.workspaces.verify_domain(&domain).await?;
 
     tracing::info!("Domain {} verified for workspace {}", domain, workspace_id);
 
@@ -412,13 +350,7 @@ async fn list_domains(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Check if user is an admin of any workspace
-    let admin_workspace = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin_workspace = state.repos.workspaces.find_admin_by_user(user.id).await?;
 
     let workspace_id = match admin_workspace {
         Some(a) => a.workspace_id,
@@ -430,13 +362,7 @@ async fn list_domains(
         }
     };
 
-    let domains = sqlx::query_as!(
-        WorkspaceDomain,
-        "SELECT * FROM workspace_domains WHERE workspace_id = $1 ORDER BY created_at DESC",
-        workspace_id
-    )
-    .fetch_all(&state.database)
-    .await?;
+    let domains = state.repos.workspaces.list_domains(workspace_id).await?;
 
     let domain_infos: Vec<DomainInfo> = domains
         .into_iter()
@@ -459,13 +385,7 @@ async fn get_policies(
     // Get workspace for this user (via admin or domain membership)
     let workspace_id = get_user_workspace_id(&state, user.id).await?;
 
-    let policy = sqlx::query_as!(
-        WorkspacePolicy,
-        "SELECT * FROM workspace_policies WHERE workspace_id = $1",
-        workspace_id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let policy = state.repos.workspaces.get_policy(workspace_id).await?;
 
     let response = match policy {
         Some(p) => WorkspacePolicies {
@@ -501,13 +421,7 @@ async fn update_policies(
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Verify user is a workspace admin
-    let admin = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user.id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin = state.repos.workspaces.find_admin_by_user(user.id).await?;
 
     let workspace_id = match admin {
         Some(a) => a.workspace_id,
@@ -520,13 +434,12 @@ async fn update_policies(
     };
 
     // Verify workspace has active subscription
-    let workspace = sqlx::query_as!(
-        Workspace,
-        "SELECT * FROM workspaces WHERE id = $1",
-        workspace_id
-    )
-    .fetch_one(&state.database)
-    .await?;
+    let workspace = state
+        .repos
+        .workspaces
+        .find_by_id(workspace_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Workspace not found")))?;
 
     if !workspace.has_active_subscription() {
         return Err(AppError::External(
@@ -569,32 +482,17 @@ async fn update_policies(
     }
 
     // Upsert policies
-    sqlx::query!(
-        r#"
-        INSERT INTO workspace_policies (
-            workspace_id, max_ttl_seconds, min_ttl_seconds, default_ttl_seconds,
-            require_once, default_once, allow_external, updated_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-        ON CONFLICT (workspace_id) DO UPDATE SET
-            max_ttl_seconds = $2,
-            min_ttl_seconds = $3,
-            default_ttl_seconds = $4,
-            require_once = $5,
-            default_once = $6,
-            allow_external = $7,
-            updated_at = NOW()
-        "#,
+    let policy = WorkspacePolicy {
         workspace_id,
-        payload.max_ttl_seconds,
-        payload.min_ttl_seconds,
-        payload.default_ttl_seconds,
-        payload.require_once,
-        payload.default_once,
-        payload.allow_external
-    )
-    .execute(&state.database)
-    .await?;
+        max_ttl_seconds: payload.max_ttl_seconds,
+        min_ttl_seconds: payload.min_ttl_seconds,
+        default_ttl_seconds: payload.default_ttl_seconds,
+        require_once: payload.require_once,
+        default_once: payload.default_once,
+        allow_external: payload.allow_external,
+        updated_at: chrono::Utc::now(),
+    };
+    state.repos.workspaces.upsert_policy(workspace_id, &policy).await?;
 
     tracing::info!(
         workspace_id = %workspace_id,
@@ -611,33 +509,20 @@ async fn get_user_workspace_id(
     user_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, AppError> {
     // First check if user is an admin
-    let admin = sqlx::query_as!(
-        WorkspaceAdmin,
-        "SELECT * FROM workspace_admins WHERE user_id = $1",
-        user_id
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let admin = state.repos.workspaces.find_admin_by_user(user_id).await?;
 
     if let Some(a) = admin {
         return Ok(a.workspace_id);
     }
 
     // Otherwise, find workspace via email domain
-    let email_domain = get_user_email_domain(&state.database, user_id).await?;
+    let email_domain = get_user_email_domain(state, user_id).await?;
 
-    let workspace = sqlx::query_as!(
-        Workspace,
-        r#"
-        SELECT w.*
-        FROM workspaces w
-        JOIN workspace_domains wd ON wd.workspace_id = w.id
-        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
-        "#,
-        &email_domain
-    )
-    .fetch_optional(&state.database)
-    .await?;
+    let workspace = state
+        .repos
+        .workspaces
+        .find_by_verified_domain(&email_domain)
+        .await?;
 
     match workspace {
         Some(w) => Ok(w.id),

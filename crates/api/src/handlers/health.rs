@@ -20,18 +20,8 @@ struct HealthResponse {
 }
 
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.database)
-        .await
-        .is_ok();
-
-    let redis_ok = match state.redis.get_multiplexed_async_connection().await {
-        Ok(mut conn) => redis::cmd("PING")
-            .query_async::<String>(&mut conn)
-            .await
-            .is_ok(),
-        Err(_) => false,
-    };
+    let db_ok = state.repos.status.health_check().await.unwrap_or(false);
+    let redis_ok = state.stores.drops.health_check().await.unwrap_or(false);
 
     let healthy = db_ok && redis_ok;
 
