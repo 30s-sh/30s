@@ -362,10 +362,16 @@ async fn get_inbox(
 ) -> Result<impl IntoResponse, AppError> {
     let mut redis = state.redis.get_multiplexed_async_connection().await?;
     let inbox_key = format!("inbox:{}", user.id);
-
-    // Query inbox sorted set for drops with expiration >= now. Using ZRANGEBYSCORE
-    // with the current timestamp filters out expired drops efficiently.
     let now = Utc::now().timestamp() as f64;
+
+    // Clean up expired entries (score < now) on each inbox access.
+    // This prevents unbounded growth of stale entries over time.
+    let _: () = redis
+        .zrembyscore(&inbox_key, f64::NEG_INFINITY, now)
+        .await
+        .unwrap_or_default();
+
+    // Query inbox sorted set for drops with expiration >= now.
     let drop_ids: Vec<String> = redis
         .zrangebyscore(&inbox_key, now, f64::MAX)
         .await
