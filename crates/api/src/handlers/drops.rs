@@ -37,7 +37,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::{Datelike, Months, TimeZone, Utc};
+use chrono::{Datelike, Months, NaiveDate, Utc};
 use garde::Validate;
 use redis::AsyncCommands;
 use shared::api::{AppliedPolicies, CreateDropPayload, CreateDropResponse, Drop, InboxItem};
@@ -73,12 +73,15 @@ async fn check_rate_limit(
 
     if count == 1 {
         // First request this month - set TTL to expire at start of next month
-        let start_of_month = Utc
-            .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-            .single()
-            .ok_or_else(|| anyhow::anyhow!("failed to calculate start of month"))?;
-        let next_month = start_of_month + Months::new(1);
-        let ttl = (next_month - now).num_seconds();
+        // Using NaiveDate is infallible for valid year/month/day=1 combinations
+        let next_month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+            .expect("day 1 is always valid")
+            .checked_add_months(Months::new(1))
+            .expect("month arithmetic overflow")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc();
+        let ttl = (next_month_start - now).num_seconds();
 
         let _: () = redis::cmd("EXPIRE")
             .arg(key)
