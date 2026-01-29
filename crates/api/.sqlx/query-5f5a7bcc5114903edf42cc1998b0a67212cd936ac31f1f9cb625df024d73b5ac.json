@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM workspace_policies WHERE workspace_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_ttl_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "min_ttl_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "default_ttl_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "require_once",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "default_once",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "allow_external",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "5f5a7bcc5114903edf42cc1998b0a67212cd936ac31f1f9cb625df024d73b5ac"
+}

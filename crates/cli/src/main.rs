@@ -233,6 +233,18 @@ enum WorkspaceCommands {
     /// List all domains for your workspace
     #[command(after_help = "Example: 30s workspace domains")]
     Domains,
+    /// View workspace policies
+    #[command(after_help = "Example: 30s workspace policies")]
+    Policies,
+    /// Set or clear a workspace policy (admin only)
+    #[command(after_help = "Examples:
+  30s workspace policy set max-ttl 1h
+  30s workspace policy set require-once true
+  30s workspace policy clear max-ttl")]
+    Policy {
+        #[command(subcommand)]
+        action: PolicyCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -258,6 +270,30 @@ enum DomainCommands {
     Verify {
         /// Domain to verify
         domain: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// Set a policy value
+    #[command(after_help = "Examples:
+  30s workspace policy set max-ttl 1h
+  30s workspace policy set min-ttl 5m
+  30s workspace policy set default-ttl 10m
+  30s workspace policy set require-once true
+  30s workspace policy set default-once true
+  30s workspace policy set allow-external false")]
+    Set {
+        /// Policy key: max-ttl, min-ttl, default-ttl, require-once, default-once, allow-external
+        key: String,
+        /// Policy value (duration for TTL, true/false for booleans)
+        value: String,
+    },
+    /// Clear a policy restriction
+    #[command(after_help = "Example: 30s workspace policy clear max-ttl")]
+    Clear {
+        /// Policy key to clear
+        key: String,
     },
 }
 
@@ -344,6 +380,15 @@ async fn run() -> anyhow::Result<()> {
                 }
             },
             Some(WorkspaceCommands::Domains) => commands::workspace::list_domains(&config).await,
+            Some(WorkspaceCommands::Policies) => commands::workspace::policies(&config).await,
+            Some(WorkspaceCommands::Policy { action }) => match action {
+                PolicyCommands::Set { key, value } => {
+                    commands::workspace::set_policy(&config, &key, &value).await
+                }
+                PolicyCommands::Clear { key } => {
+                    commands::workspace::clear_policy(&config, &key).await
+                }
+            },
             None => commands::workspace::status(&config).await,
         },
         Commands::Billing { action } => match action {

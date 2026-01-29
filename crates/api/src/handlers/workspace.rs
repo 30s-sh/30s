@@ -10,8 +10,8 @@ use axum::{
 };
 use garde::Validate;
 use shared::api::{
-    AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo, VerifyDomainResponse,
-    WorkspaceInfo,
+    AddDomainPayload, AddDomainResponse, CreateWorkspacePayload, DomainInfo,
+    UpdatePoliciesPayload, VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
 };
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     middleware::auth::AuthUser,
-    models::{User, Workspace, WorkspaceAdmin, WorkspaceDomain},
+    models::{User, Workspace, WorkspaceAdmin, WorkspaceDomain, WorkspacePolicy},
     state::AppState,
 };
 
@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(get_workspace).post(create_workspace))
         .route("/domains", get(list_domains).post(add_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
+        .route("/policies", get(get_policies).put(update_policies))
 }
 
 /// Extract the domain portion from an email address.
@@ -453,4 +454,202 @@ async fn list_domains(
         .collect();
 
     Ok(Json(domain_infos))
+}
+
+/// Get workspace policies (any workspace member can view).
+#[debug_handler]
+async fn get_policies(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    // Get workspace for this user (via admin or domain membership)
+    let workspace_id = get_user_workspace_id(&state, user.id).await?;
+
+    let policy = sqlx::query_as!(
+        WorkspacePolicy,
+        "SELECT * FROM workspace_policies WHERE workspace_id = $1",
+        workspace_id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    let response = match policy {
+        Some(p) => WorkspacePolicies {
+            max_ttl_seconds: p.max_ttl_seconds,
+            min_ttl_seconds: p.min_ttl_seconds,
+            default_ttl_seconds: p.default_ttl_seconds,
+            require_once: p.require_once,
+            default_once: p.default_once,
+            allow_external: p.allow_external,
+        },
+        None => WorkspacePolicies {
+            max_ttl_seconds: None,
+            min_ttl_seconds: None,
+            default_ttl_seconds: None,
+            require_once: None,
+            default_once: None,
+            allow_external: None,
+        },
+    };
+
+    Ok(Json(response))
+}
+
+/// Update workspace policies (admin only).
+#[debug_handler]
+async fn update_policies(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdatePoliciesPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Verify user is a workspace admin
+    let admin = sqlx::query_as!(
+        WorkspaceAdmin,
+        "SELECT * FROM workspace_admins WHERE user_id = $1",
+        user.id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    let workspace_id = match admin {
+        Some(a) => a.workspace_id,
+        None => {
+            return Err(AppError::External(
+                StatusCode::FORBIDDEN,
+                "Only workspace admins can update policies",
+            ))
+        }
+    };
+
+    // Verify workspace has active subscription
+    let workspace = sqlx::query_as!(
+        Workspace,
+        "SELECT * FROM workspaces WHERE id = $1",
+        workspace_id
+    )
+    .fetch_one(&state.database)
+    .await?;
+
+    if !workspace.has_active_subscription() {
+        return Err(AppError::External(
+            StatusCode::PAYMENT_REQUIRED,
+            "Active subscription required to set policies. Run: 30s billing subscribe",
+        ));
+    }
+
+    // Validate TTL consistency
+    if let (Some(min), Some(max)) = (payload.min_ttl_seconds, payload.max_ttl_seconds)
+        && min > max
+    {
+        return Err(AppError::Validation(
+            "min_ttl_seconds cannot be greater than max_ttl_seconds".to_string(),
+        ));
+    }
+
+    if let Some(default) = payload.default_ttl_seconds {
+        if let Some(min) = payload.min_ttl_seconds
+            && default < min
+        {
+            return Err(AppError::Validation(
+                "default_ttl_seconds cannot be less than min_ttl_seconds".to_string(),
+            ));
+        }
+        if let Some(max) = payload.max_ttl_seconds
+            && default > max
+        {
+            return Err(AppError::Validation(
+                "default_ttl_seconds cannot be greater than max_ttl_seconds".to_string(),
+            ));
+        }
+    }
+
+    // Validate once consistency
+    if payload.require_once == Some(true) && payload.default_once == Some(false) {
+        return Err(AppError::Validation(
+            "default_once cannot be false when require_once is true".to_string(),
+        ));
+    }
+
+    // Upsert policies
+    sqlx::query!(
+        r#"
+        INSERT INTO workspace_policies (
+            workspace_id, max_ttl_seconds, min_ttl_seconds, default_ttl_seconds,
+            require_once, default_once, allow_external, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (workspace_id) DO UPDATE SET
+            max_ttl_seconds = $2,
+            min_ttl_seconds = $3,
+            default_ttl_seconds = $4,
+            require_once = $5,
+            default_once = $6,
+            allow_external = $7,
+            updated_at = NOW()
+        "#,
+        workspace_id,
+        payload.max_ttl_seconds,
+        payload.min_ttl_seconds,
+        payload.default_ttl_seconds,
+        payload.require_once,
+        payload.default_once,
+        payload.allow_external
+    )
+    .execute(&state.database)
+    .await?;
+
+    tracing::info!(
+        workspace_id = %workspace_id,
+        user_id = %user.id,
+        "workspace policies updated"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+/// Get workspace ID for a user (via admin membership or domain).
+async fn get_user_workspace_id(
+    state: &AppState,
+    user_id: uuid::Uuid,
+) -> Result<uuid::Uuid, AppError> {
+    // First check if user is an admin
+    let admin = sqlx::query_as!(
+        WorkspaceAdmin,
+        "SELECT * FROM workspace_admins WHERE user_id = $1",
+        user_id
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    if let Some(a) = admin {
+        return Ok(a.workspace_id);
+    }
+
+    // Otherwise, find workspace via email domain
+    let email_domain = get_user_email_domain(&state.database, user_id).await?;
+
+    let workspace = sqlx::query_as!(
+        Workspace,
+        r#"
+        SELECT w.*
+        FROM workspaces w
+        JOIN workspace_domains wd ON wd.workspace_id = w.id
+        WHERE wd.domain = $1 AND wd.verified_at IS NOT NULL
+        "#,
+        &email_domain
+    )
+    .fetch_optional(&state.database)
+    .await?;
+
+    match workspace {
+        Some(w) => Ok(w.id),
+        None => Err(AppError::External(
+            StatusCode::NOT_FOUND,
+            "No workspace found for your email domain",
+        )),
+    }
 }

@@ -55,6 +55,18 @@ pub struct WorkspaceAdmin {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkspacePolicy {
+    pub workspace_id: Uuid,
+    pub max_ttl_seconds: Option<i32>,
+    pub min_ttl_seconds: Option<i32>,
+    pub default_ttl_seconds: Option<i32>,
+    pub require_once: Option<bool>,
+    pub default_once: Option<bool>,
+    pub allow_external: Option<bool>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Drop stored in Redis with automatic expiration via TTL.
 ///
 /// Drops are ephemeral encrypted secrets. The server only stores ciphertext and

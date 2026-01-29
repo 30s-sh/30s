@@ -7,7 +7,8 @@ use shared::api::{
     CreateDropPayload, CreateDropResponse, CreatePortalSessionResponse, CreateWorkspacePayload,
     DeviceInfo, DevicePublicKey, DomainInfo, Drop, GetPublicKeysPayload, InboxItem, MeResponse,
     RegisterDevicePayload, RequestCodePayload, RotateVerifyPayload, RotateVerifyResponse,
-    VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse, WorkspaceInfo,
+    UpdatePoliciesPayload, VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse,
+    WorkspaceInfo, WorkspacePolicies,
 };
 
 pub struct Api {
@@ -367,6 +368,39 @@ impl Api {
         .await?;
 
         Ok(response.json().await?)
+    }
+
+    /// Gets workspace policies.
+    pub async fn get_policies(&self, key: String) -> Result<WorkspacePolicies> {
+        let response = Self::check_response(
+            self.http
+                .get(format!("{}/workspace/policies", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Updates workspace policies (admin only).
+    pub async fn update_policies(
+        &self,
+        key: String,
+        payload: UpdatePoliciesPayload,
+    ) -> Result<()> {
+        Self::check_response(
+            self.http
+                .put(format!("{}/workspace/policies", self.base_url))
+                .bearer_auth(key)
+                .json(&payload)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn check_response(response: Response) -> Result<Response> {

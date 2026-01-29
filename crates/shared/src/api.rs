@@ -113,6 +113,20 @@ pub struct GetPublicKeysPayload {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateDropResponse {
     pub id: String,
+    /// Workspace policies that were applied to this drop (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_policies: Option<AppliedPolicies>,
+}
+
+/// Indicates which workspace policies were applied to a drop.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppliedPolicies {
+    /// Workspace default TTL was applied (value in seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_ttl_applied: Option<i32>,
+    /// Burn-after-reading was enforced by workspace policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub once_enforced: Option<bool>,
 }
 
 /// Summary of a drop in the inbox listing.
@@ -259,6 +273,50 @@ pub struct BillingStatus {
     pub subscription_status: String,
     /// Whether the workspace has an active subscription.
     pub is_paid: bool,
+}
+
+// ============================================================================
+// Workspace Policy types
+// ============================================================================
+
+/// Workspace policies response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspacePolicies {
+    /// Maximum allowed TTL in seconds (NULL = no limit beyond global 24h).
+    pub max_ttl_seconds: Option<i32>,
+    /// Minimum required TTL in seconds (NULL = no minimum).
+    pub min_ttl_seconds: Option<i32>,
+    /// Default TTL applied when sender uses 30s default.
+    pub default_ttl_seconds: Option<i32>,
+    /// Force burn-after-reading for all drops.
+    pub require_once: Option<bool>,
+    /// Default burn-after-reading when sender does not specify.
+    pub default_once: Option<bool>,
+    /// Allow sending to recipients outside workspace domains.
+    pub allow_external: Option<bool>,
+}
+
+/// Request to update workspace policies.
+#[derive(Debug, Serialize, Deserialize, Validate)]
+pub struct UpdatePoliciesPayload {
+    /// Maximum allowed TTL in seconds (NULL = no limit beyond global 24h).
+    #[garde(skip)]
+    pub max_ttl_seconds: Option<i32>,
+    /// Minimum required TTL in seconds (NULL = no minimum).
+    #[garde(skip)]
+    pub min_ttl_seconds: Option<i32>,
+    /// Default TTL applied when sender uses 30s default.
+    #[garde(skip)]
+    pub default_ttl_seconds: Option<i32>,
+    /// Force burn-after-reading for all drops.
+    #[garde(skip)]
+    pub require_once: Option<bool>,
+    /// Default burn-after-reading when sender does not specify.
+    #[garde(skip)]
+    pub default_once: Option<bool>,
+    /// Allow sending to recipients outside workspace domains.
+    #[garde(skip)]
+    pub allow_external: Option<bool>,
 }
 
 #[cfg(test)]
