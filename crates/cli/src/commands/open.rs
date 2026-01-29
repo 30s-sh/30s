@@ -58,7 +58,10 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
             // This shouldn't happen when opening (we only have one key from sender)
             // but handle it anyway
             eprintln!();
-            ui::warning(&format!("New device key(s) for {}", ui::bold(&drop.sender_email)));
+            ui::warning(&format!(
+                "New device key(s) for {}",
+                ui::bold(&drop.sender_email)
+            ));
             for fp in &new {
                 eprintln!("  New: {}", ui::fingerprint(fp));
             }
@@ -81,7 +84,10 @@ pub async fn run(config: &Config, drop_id: String) -> Result<()> {
         known_keys::KeyCheckResult::KeysMissing { missing } => {
             // Sender's key changed - warn and prompt
             eprintln!();
-            ui::warning(&format!("Missing device key(s) for {}", ui::bold(&drop.sender_email)));
+            ui::warning(&format!(
+                "Missing device key(s) for {}",
+                ui::bold(&drop.sender_email)
+            ));
             for fp in &missing {
                 eprintln!("  Missing: {}", fp.dimmed());
             }

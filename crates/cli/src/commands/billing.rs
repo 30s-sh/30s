@@ -11,7 +11,10 @@ pub async fn status(config: &Config) -> Result<()> {
 
     match api.billing_status(api_key).await {
         Ok(status) => {
-            println!("Subscription: {}", format_status(&status.subscription_status));
+            println!(
+                "Subscription: {}",
+                format_status(&status.subscription_status)
+            );
             if status.is_paid {
                 println!("Benefits:     Unlimited internal sends, 50/month external");
             } else {

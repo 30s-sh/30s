@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod alias;
 pub mod billing;
 pub mod delete;

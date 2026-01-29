@@ -5,11 +5,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use hickory_resolver::{
-    Resolver,
-    config::ResolverConfig,
-    name_server::TokioConnectionProvider,
-};
+use hickory_resolver::{Resolver, config::ResolverConfig, name_server::TokioConnectionProvider};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
