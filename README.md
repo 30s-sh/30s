@@ -1,7 +1,3 @@
-# 30s
-
-> Encrypted handoffs in seconds.
-
 ## Install
 
 ```bash
@@ -17,27 +13,12 @@ curl -sSL https://30s.sh/install.sh | sh
 # Send a secret (expires in 30 seconds by default)
 30s send -t bob@ac.me "api_key_12345"
 
-# Send with custom expiration
-30s send -t bob@ac.me "database_password" 5m
-
 # Check your inbox
 30s inbox
 
 # Open a received secret
 30s open <drop-id>
 ```
-
-## Status
-
-### Self-hosting
-
-30s is open source so you can audit it and run it yourself if you want. That said, **self-hosting is not officially supported right now**. I’m focused on shipping and operating the hosted service, and I don’t have bandwidth to provide deployment support, troubleshooting, or infrastructure docs. This could change in the future.
-
-If you’d like to improve the self-hosting story, **PRs are welcome** (compose files, docs, charts, etc.). Just please expect best-effort review rather than full-time support.
-
-### AI usage (Claude)
-
-Claude was used to help with documentation and some straightforward app plumbing. **All AI-assisted changes were reviewed carefully.** Claude was **not** used to write the sensitive cryptography parts (encryption/decryption, key handling, protocol design), which were implemented manually.
 
 ## License
 
@@ -47,3 +28,7 @@ or [MIT](https://github.com/30s-sh/30s/blob/main/LICENSE-MIT) license at your op
 Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed
 as above, without any additional terms or conditions.
+
+---
+
+*Built with AI assist for the boring parts; crypto by human.*
