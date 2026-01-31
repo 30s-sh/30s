@@ -69,52 +69,27 @@ async fn get_workspace(
     user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    // First check if user is an admin of any workspace
-    let admin_workspace = state.repos.workspaces.find_admin_by_user(user.id).await?;
-
-    if let Some(admin) = admin_workspace {
-        let workspace = state
-            .repos
-            .workspaces
-            .find_by_id(admin.workspace_id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Workspace not found")))?;
-
-        let is_paid = workspace.has_active_subscription();
-        return Ok(Json(WorkspaceInfo {
-            id: workspace.id,
-            name: workspace.name,
-            created_at: workspace.created_at,
-            subscription_status: workspace.subscription_status,
-            is_paid,
-        }));
-    }
-
-    // Otherwise, find a verified domain that matches the user's email domain
-    let email_domain = get_user_email_domain(&state, user.id).await?;
-
-    let workspace = state
+    let membership = state
         .repos
-        .workspaces
-        .find_by_verified_domain(&email_domain)
-        .await?;
+        .membership
+        .get_membership(user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::External(
+                StatusCode::NOT_FOUND,
+                "No workspace found for your email domain",
+            )
+        })?;
 
-    match workspace {
-        Some(w) => {
-            let is_paid = w.has_active_subscription();
-            Ok(Json(WorkspaceInfo {
-                id: w.id,
-                name: w.name,
-                created_at: w.created_at,
-                subscription_status: w.subscription_status,
-                is_paid,
-            }))
-        }
-        None => Err(AppError::External(
-            StatusCode::NOT_FOUND,
-            "No workspace found for your email domain",
-        )),
-    }
+    let workspace = membership.workspace;
+    let is_paid = workspace.has_active_subscription();
+    Ok(Json(WorkspaceInfo {
+        id: workspace.id,
+        name: workspace.name,
+        created_at: workspace.created_at,
+        subscription_status: workspace.subscription_status,
+        is_paid,
+    }))
 }
 
 /// Create a new workspace. The user becomes an admin.
@@ -383,9 +358,23 @@ async fn get_policies(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Get workspace for this user (via admin or domain membership)
-    let workspace_id = get_user_workspace_id(&state, user.id).await?;
+    let membership = state
+        .repos
+        .membership
+        .get_membership(user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::External(
+                StatusCode::NOT_FOUND,
+                "No workspace found for your email domain",
+            )
+        })?;
 
-    let policy = state.repos.workspaces.get_policy(workspace_id).await?;
+    let policy = state
+        .repos
+        .workspaces
+        .get_policy(membership.workspace.id)
+        .await?;
 
     let response = match policy {
         Some(p) => WorkspacePolicies {
@@ -503,32 +492,3 @@ async fn update_policies(
     Ok(StatusCode::OK)
 }
 
-/// Get workspace ID for a user (via admin membership or domain).
-async fn get_user_workspace_id(
-    state: &AppState,
-    user_id: uuid::Uuid,
-) -> Result<uuid::Uuid, AppError> {
-    // First check if user is an admin
-    let admin = state.repos.workspaces.find_admin_by_user(user_id).await?;
-
-    if let Some(a) = admin {
-        return Ok(a.workspace_id);
-    }
-
-    // Otherwise, find workspace via email domain
-    let email_domain = get_user_email_domain(state, user_id).await?;
-
-    let workspace = state
-        .repos
-        .workspaces
-        .find_by_verified_domain(&email_domain)
-        .await?;
-
-    match workspace {
-        Some(w) => Ok(w.id),
-        None => Err(AppError::External(
-            StatusCode::NOT_FOUND,
-            "No workspace found for your email domain",
-        )),
-    }
-}

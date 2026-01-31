@@ -94,26 +94,17 @@ fn verify_stripe_signature(
 
 /// Get the workspace the user is an admin of.
 async fn get_admin_workspace(state: &AppState, user_id: uuid::Uuid) -> Result<Workspace, AppError> {
-    let admin = state
+    state
         .repos
-        .workspaces
-        .find_admin_by_user(user_id)
+        .membership
+        .get_admin_workspace(user_id)
         .await?
         .ok_or_else(|| {
             AppError::External(
                 StatusCode::FORBIDDEN,
                 "You must be a workspace admin to manage billing",
             )
-        })?;
-
-    let workspace = state
-        .repos
-        .workspaces
-        .find_by_id(admin.workspace_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Admin's workspace not found")))?;
-
-    Ok(workspace)
+        })
 }
 
 /// Create a Stripe Checkout session for workspace subscription.

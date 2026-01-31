@@ -25,49 +25,23 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/activity", get(get_activity))
 }
 
-/// Get the user's workspace ID via admin membership or domain.
-/// Returns (workspace_id, is_admin).
-async fn get_user_workspace(state: &AppState, user_id: Uuid) -> Result<(Uuid, bool), AppError> {
-    // Check if user is an admin
-    let admin = state.repos.workspaces.find_admin_by_user(user_id).await?;
-
-    if let Some(a) = admin {
-        return Ok((a.workspace_id, true));
-    }
-
-    // Find workspace via email domain
-    let user = state
-        .repos
-        .users
-        .find_by_id(user_id)
-        .await?
-        .ok_or_else(|| AppError::External(StatusCode::NOT_FOUND, "User not found"))?;
-
-    let email_domain = user
-        .email
-        .split('@')
-        .nth(1)
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Invalid email format")))?;
-
-    // Use find_paid_by_domain since activity log is only for paid workspaces
-    let workspace = state.repos.workspaces.find_paid_by_domain(email_domain).await?;
-
-    match workspace {
-        Some(w) => Ok((w.id, false)),
-        None => Err(AppError::External(
-            StatusCode::NOT_FOUND,
-            "No workspace found for your email domain",
-        )),
-    }
-}
-
 #[debug_handler]
 async fn get_activity(
     user: AuthUser,
     State(state): State<AppState>,
     Query(query): Query<ActivityLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (workspace_id, is_admin) = get_user_workspace(&state, user.id).await?;
+    let membership = state
+        .repos
+        .membership
+        .get_paid_membership(user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::External(
+                StatusCode::NOT_FOUND,
+                "No paid workspace found for your account",
+            )
+        })?;
 
     // Limit: None = unlimited, Some(n) = n entries (max 10000)
     let limit = match query.limit {
@@ -81,13 +55,17 @@ async fn get_activity(
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
 
     // Non-admins can only see their own activity
-    let actor_filter = if is_admin { None } else { Some(user.id) };
+    let actor_filter = if membership.is_admin {
+        None
+    } else {
+        Some(user.id)
+    };
 
     let entries = state
         .repos
         .activity
         .query(ActivityQuery {
-            workspace_id,
+            workspace_id: membership.workspace.id,
             actor_id: actor_filter,
             since,
             event_type: query.event_type.clone(),
@@ -120,4 +98,222 @@ async fn get_activity(
     Ok(Json(ActivityLogResponse {
         entries: response_entries,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use crate::models::WorkspaceActivityLog;
+    use crate::repos::{ActivityQuery, MembershipInfo, MockActivityRepo, MockWorkspaceMembership};
+    use crate::test_utils::{mock_user, mock_workspace, TestStateBuilder};
+
+    #[tokio::test]
+    async fn get_activity_returns_events_for_admin() {
+        // Admin can view all workspace activity
+        let admin = mock_user("admin@acme.com");
+        let admin_id = admin.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        // Membership service returns admin membership
+        let workspace_clone = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone.clone(),
+                    is_admin: true,
+                }))
+            });
+
+        // Mock activity entries
+        let entry = WorkspaceActivityLog {
+            id: Uuid::new_v4(),
+            workspace_id,
+            event_type: "drop.sent".to_string(),
+            actor_id: admin_id,
+            drop_id: Some(Uuid::new_v4()),
+            metadata: serde_json::json!({"recipient_count": 1}),
+            created_at: chrono::Utc::now(),
+        };
+        let entry_clone = entry.clone();
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_query()
+            .withf(move |q: &ActivityQuery| {
+                // Admin should see all activity (no actor_id filter)
+                q.workspace_id == workspace_id && q.actor_id.is_none()
+            })
+            .returning(move |_| Ok(vec![entry_clone.clone()]));
+        activity_repo
+            .expect_find_users_by_ids()
+            .returning(move |_| Ok(vec![mock_user("admin@acme.com")]));
+
+        let state = TestStateBuilder::new()
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let query = ActivityLogQuery {
+            since: None,
+            event_type: None,
+            limit: Some(50),
+        };
+
+        let result = get_activity(AuthUser { id: admin_id }, State(state), Query(query))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_activity_returns_own_events_for_domain_member() {
+        // Non-admin can only view their own activity
+        let member = mock_user("member@acme.com");
+        let member_id = member.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        // Membership service returns domain membership (not admin)
+        let workspace_clone = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone.clone(),
+                    is_admin: false,
+                }))
+            });
+
+        // Mock activity entries
+        let entry = WorkspaceActivityLog {
+            id: Uuid::new_v4(),
+            workspace_id,
+            event_type: "drop.sent".to_string(),
+            actor_id: member_id,
+            drop_id: Some(Uuid::new_v4()),
+            metadata: serde_json::json!({"recipient_count": 1}),
+            created_at: chrono::Utc::now(),
+        };
+        let entry_clone = entry.clone();
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_query()
+            .withf(move |q: &ActivityQuery| {
+                // Non-admin should only see their own activity
+                q.workspace_id == workspace_id && q.actor_id == Some(member_id)
+            })
+            .returning(move |_| Ok(vec![entry_clone.clone()]));
+        activity_repo
+            .expect_find_users_by_ids()
+            .returning(move |_| Ok(vec![mock_user("member@acme.com")]));
+
+        let state = TestStateBuilder::new()
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let query = ActivityLogQuery {
+            since: None,
+            event_type: None,
+            limit: Some(50),
+        };
+
+        let result = get_activity(AuthUser { id: member_id }, State(state), Query(query))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_activity_returns_not_found_for_non_member() {
+        // User not in any workspace should get 404
+        let user = mock_user("outsider@gmail.com");
+        let user_id = user.id;
+
+        // Membership service returns None (no workspace)
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
+        let state = TestStateBuilder::new()
+            .with_membership_service(membership_service)
+            .build();
+
+        let query = ActivityLogQuery {
+            since: None,
+            event_type: None,
+            limit: Some(50),
+        };
+
+        let result = get_activity(AuthUser { id: user_id }, State(state), Query(query)).await;
+
+        let Err(err) = result else {
+            panic!("Expected error, got Ok");
+        };
+        match err {
+            AppError::External(status, _) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("Expected External error, got {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_activity_works_for_admin_without_verified_domain() {
+        // Admin whose domain is NOT verified should still access activity
+        let admin = mock_user("admin@unverified.com");
+        let admin_id = admin.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        // Membership service returns admin membership (even without verified domain)
+        let workspace_clone = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone.clone(),
+                    is_admin: true,
+                }))
+            });
+
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_query()
+            .withf(move |q: &ActivityQuery| {
+                q.workspace_id == workspace_id && q.actor_id.is_none()
+            })
+            .returning(|_| Ok(vec![]));
+        activity_repo
+            .expect_find_users_by_ids()
+            .returning(|_| Ok(vec![]));
+
+        let state = TestStateBuilder::new()
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let query = ActivityLogQuery {
+            since: None,
+            event_type: None,
+            limit: Some(50),
+        };
+
+        let result = get_activity(AuthUser { id: admin_id }, State(state), Query(query))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

@@ -9,6 +9,7 @@
 //! - **devices** - Device management (public keys for encryption)
 //! - **workspaces** - Workspace, domain verification, and policies
 //! - **activity** - Audit logging for workspace activity
+//! - **membership** - Workspace membership resolution (admin or domain)
 //!
 //! ## Usage in Handlers
 //!
@@ -23,12 +24,14 @@
 
 mod activity;
 mod devices;
+mod membership;
 mod status;
 mod users;
 mod workspaces;
 
 pub use activity::{events, is_internal_send, ActivityQuery, ActivityRepo, PgActivityRepo};
 pub use devices::{DeviceRepo, PgDeviceRepo};
+pub use membership::{PgWorkspaceMembership, WorkspaceMembership};
 pub use status::{PgStatusRepo, StatusRepo};
 pub use users::{PgUserRepo, UserRepo};
 pub use workspaces::{PgWorkspaceRepo, WorkspaceRepo};
@@ -37,6 +40,8 @@ pub use workspaces::{PgWorkspaceRepo, WorkspaceRepo};
 pub use activity::MockActivityRepo;
 #[cfg(test)]
 pub use devices::MockDeviceRepo;
+#[cfg(test)]
+pub use membership::{MembershipInfo, MockWorkspaceMembership};
 #[cfg(test)]
 pub use status::MockStatusRepo;
 #[cfg(test)]
@@ -54,4 +59,5 @@ pub struct Repos {
     pub workspaces: Arc<dyn WorkspaceRepo>,
     pub activity: Arc<dyn ActivityRepo>,
     pub status: Arc<dyn StatusRepo>,
+    pub membership: Arc<dyn WorkspaceMembership>,
 }
