@@ -14,6 +14,9 @@ pub trait WorkspaceRepo: Send + Sync {
     /// Find a workspace by ID.
     async fn find_by_id(&self, id: Uuid) -> Result<Option<Workspace>>;
 
+    /// Find a paid workspace by ID (active or past_due subscription).
+    async fn find_paid_by_id(&self, id: Uuid) -> Result<Option<Workspace>>;
+
     /// Find a paid workspace by domain (active or past_due subscription).
     async fn find_paid_by_domain(&self, domain: &str) -> Result<Option<Workspace>>;
 
@@ -93,6 +96,22 @@ impl WorkspaceRepo for PgWorkspaceRepo {
             r#"
             SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status
             FROM workspaces WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(workspace)
+    }
+
+    async fn find_paid_by_id(&self, id: Uuid) -> Result<Option<Workspace>> {
+        let workspace = sqlx::query_as!(
+            Workspace,
+            r#"
+            SELECT id, name, created_at, stripe_customer_id, stripe_subscription_id, subscription_status
+            FROM workspaces
+            WHERE id = $1
+            AND (subscription_status = 'active' OR subscription_status = 'past_due')
             "#,
             id
         )

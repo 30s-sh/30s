@@ -26,7 +26,10 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use crate::{
     config::Config,
-    repos::{PgActivityRepo, PgDeviceRepo, PgStatusRepo, PgUserRepo, PgWorkspaceRepo, Repos},
+    repos::{
+        PgActivityRepo, PgDeviceRepo, PgStatusRepo, PgUserRepo, PgWorkspaceMembership,
+        PgWorkspaceRepo, Repos,
+    },
     services::{EmailSenderImpl, HickoryDnsResolver, UnkeyAuthService, unkey},
     state::AppState,
     stores::{RedisDropStore, RedisInboxStore, RedisRateLimiter, RedisVerificationStore, Stores},
@@ -99,12 +102,19 @@ async fn main() -> Result<()> {
     let stripe = stripe::Client::new(&config.stripe_secret_key);
 
     // Build repositories
+    let users = std::sync::Arc::new(PgUserRepo::new(database.clone()));
+    let workspaces = std::sync::Arc::new(PgWorkspaceRepo::new(database.clone()));
+    let membership = std::sync::Arc::new(PgWorkspaceMembership::new(
+        users.clone(),
+        workspaces.clone(),
+    ));
     let repos = Repos {
-        users: std::sync::Arc::new(PgUserRepo::new(database.clone())),
+        users,
         devices: std::sync::Arc::new(PgDeviceRepo::new(database.clone())),
-        workspaces: std::sync::Arc::new(PgWorkspaceRepo::new(database.clone())),
+        workspaces,
         activity: std::sync::Arc::new(PgActivityRepo::new(database.clone())),
         status: std::sync::Arc::new(PgStatusRepo::new(database)),
+        membership,
     };
 
     // Build stores

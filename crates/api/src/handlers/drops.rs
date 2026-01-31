@@ -85,8 +85,18 @@ async fn create_drop(
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Invalid sender email format")))?
         .to_string();
 
-    // Check if sender belongs to a paid workspace
-    let paid_workspace = state.repos.workspaces.find_paid_by_domain(&sender_domain).await?;
+    // Check if sender belongs to a paid workspace via verified domain.
+    // This is used for rate limiting (internal vs external sends).
+    let domain_workspace = state
+        .repos
+        .workspaces
+        .find_paid_by_domain(&sender_domain)
+        .await?;
+
+    // Get user's paid workspace for features (admin or verified domain).
+    // This is used for activity logging where we care about workspace membership,
+    // not specifically domain verification.
+    let user_membership = state.repos.membership.get_paid_membership(user.id).await?;
 
     // Collect recipient emails
     let recipient_emails: Vec<String> = payload
@@ -108,8 +118,8 @@ async fn create_drop(
     // Store workspace domains for reuse in activity logging
     let mut workspace_domains: Option<Vec<String>> = None;
 
-    if let Some(ref workspace) = paid_workspace {
-        // Paid workspace: unlimited internal, 50/month external
+    if let Some(ref workspace) = domain_workspace {
+        // Paid workspace with verified domain: unlimited internal, 50/month external
         // Get all verified domains for this workspace
         let domains = state.repos.workspaces.get_verified_domains(workspace.id).await?;
         workspace_domains = Some(domains);
@@ -343,17 +353,18 @@ async fn create_drop(
         "drop created"
     );
 
-    // Log activity if sender belongs to a paid workspace
-    if let Some(ref workspace) = paid_workspace {
-        // Use workspace_domains we fetched earlier (safe unwrap, always set for paid workspaces)
-        let domains = workspace_domains.as_ref().unwrap();
-        let is_internal = is_internal_send(&recipient_emails, domains);
+    // Log activity if sender belongs to a paid workspace (admin or verified domain)
+    if let Some(ref m) = user_membership {
+        // Determine if send is internal using workspace domains (if available)
+        let is_internal = workspace_domains
+            .as_ref()
+            .is_some_and(|domains| is_internal_send(&recipient_emails, domains));
 
         state
             .repos
             .activity
             .log(
-                workspace.id,
+                m.workspace.id,
                 events::DROP_SENT,
                 user.id,
                 Some(drop_id),
@@ -442,25 +453,18 @@ async fn get_drop(
 
     tracing::info!(drop_id = %id, user_id = %user.id, once = stored_drop.once, "drop accessed");
 
-    // Log activity if either sender or recipient belongs to a paid workspace
-    // We log to the sender's workspace (they own the drop)
-    let sender_domain = stored_drop
-        .sender_email
-        .split('@')
-        .nth(1)
-        .unwrap_or_default();
-
-    if let Ok(Some(sender_workspace)) = state
+    // Log activity to sender's workspace (admin or verified domain)
+    if let Ok(Some(sender_membership)) = state
         .repos
-        .workspaces
-        .find_paid_by_domain(sender_domain)
+        .membership
+        .get_paid_membership_by_email(&stored_drop.sender_email)
         .await
     {
         state
             .repos
             .activity
             .log(
-                sender_workspace.id,
+                sender_membership.workspace.id,
                 events::DROP_OPENED,
                 user.id,
                 Some(id),
@@ -549,17 +553,11 @@ async fn delete_drop(
 
         tracing::info!(drop_id = %id, user_id = %user.id, "drop deleted");
 
-        // Log activity if sender belongs to a paid workspace
-        let sender_domain = stored_drop
-            .sender_email
-            .split('@')
-            .nth(1)
-            .unwrap_or_default();
-
-        if let Ok(Some(workspace)) = state
+        // Log activity to sender's workspace (admin or verified domain)
+        if let Ok(Some(membership)) = state
             .repos
-            .workspaces
-            .find_paid_by_domain(sender_domain)
+            .membership
+            .get_paid_membership_by_email(&stored_drop.sender_email)
             .await
         {
             let recipient_count = stored_drop.wrapped_keys.len();
@@ -567,7 +565,7 @@ async fn delete_drop(
                 .repos
                 .activity
                 .log(
-                    workspace.id,
+                    membership.workspace.id,
                     events::DROP_DELETED,
                     user.id,
                     Some(id),
@@ -586,7 +584,9 @@ async fn delete_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repos::{MockActivityRepo, MockUserRepo, MockWorkspaceRepo};
+    use crate::repos::{
+        MembershipInfo, MockActivityRepo, MockUserRepo, MockWorkspaceMembership, MockWorkspaceRepo,
+    };
     use crate::stores::{MockDropStore, MockInboxStore, MockRateLimiter, RateLimitResult};
     use crate::test_utils::{
         mock_policy, mock_stored_drop, mock_user, mock_workspace, TestStateBuilder,
@@ -670,15 +670,16 @@ mod tests {
             .expect_get()
             .returning(move |_| Ok(Some(drop_clone.clone())));
 
-        let mut workspace_repo = MockWorkspaceRepo::new();
-        workspace_repo
-            .expect_find_paid_by_domain()
+        // For activity logging: sender not in a paid workspace
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership_by_email()
             .returning(|_| Ok(None));
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_drop_store(drop_store)
-            .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .build();
 
         let result = get_drop(AuthUser { id: recipient_id }, State(state), Path(drop_id))
@@ -790,16 +791,17 @@ mod tests {
         let mut inbox_store = MockInboxStore::new();
         inbox_store.expect_remove().returning(|_, _| Ok(()));
 
-        let mut workspace_repo = MockWorkspaceRepo::new();
-        workspace_repo
-            .expect_find_paid_by_domain()
+        // For activity logging: sender not in a paid workspace
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership_by_email()
             .returning(|_| Ok(None));
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_drop_store(drop_store)
             .with_inbox_store(inbox_store)
-            .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .build();
 
         let result = delete_drop(AuthUser { id: sender_id }, State(state), Path(drop_id))
@@ -911,16 +913,17 @@ mod tests {
         let mut inbox_store = MockInboxStore::new();
         inbox_store.expect_remove().returning(|_, _| Ok(()));
 
-        let mut workspace_repo = MockWorkspaceRepo::new();
-        workspace_repo
-            .expect_find_paid_by_domain()
+        // For activity logging: sender not in a paid workspace
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership_by_email()
             .returning(|_| Ok(None));
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_drop_store(drop_store)
             .with_inbox_store(inbox_store)
-            .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .build();
 
         let result = get_drop(AuthUser { id: recipient_id }, State(state), Path(drop_id))
@@ -964,6 +967,12 @@ mod tests {
             .expect_find_paid_by_domain()
             .returning(|_| Ok(None)); // Free tier
 
+        // No paid membership for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut rate_limiter = MockRateLimiter::new();
         rate_limiter
             .expect_check_monthly()
@@ -972,6 +981,7 @@ mod tests {
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_rate_limiter(rate_limiter)
             .build();
 
@@ -1009,6 +1019,12 @@ mod tests {
             .expect_find_paid_by_domain()
             .returning(|_| Ok(None));
 
+        // No paid membership for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut rate_limiter = MockRateLimiter::new();
         rate_limiter
             .expect_check_monthly()
@@ -1017,6 +1033,7 @@ mod tests {
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_rate_limiter(rate_limiter)
             .build();
 
@@ -1052,8 +1069,15 @@ mod tests {
             .returning(move |_| Ok(Some(recipient_clone.clone())));
 
         let mut workspace_repo = MockWorkspaceRepo::new();
+        // No paid domain workspace (rate limiting check)
         workspace_repo
             .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        // No paid membership for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
             .returning(|_| Ok(None));
 
         let mut rate_limiter = MockRateLimiter::new();
@@ -1073,6 +1097,7 @@ mod tests {
             .with_inbox_store(inbox_store)
             .with_rate_limiter(rate_limiter)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .build();
 
         let payload = mock_create_drop_payload("recipient@example.com");
@@ -1163,12 +1188,19 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(policy.clone())));
 
+        // Membership service - not actually called for error case, but needed
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut activity_repo = MockActivityRepo::new();
         activity_repo.expect_log().returning(|_, _, _, _, _| ());
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1217,12 +1249,19 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(policy.clone())));
 
+        // Membership service - not actually called for error case, but needed
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut activity_repo = MockActivityRepo::new();
         activity_repo.expect_log().returning(|_, _, _, _, _| ());
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1272,12 +1311,19 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(policy.clone())));
 
+        // Membership service for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut activity_repo = MockActivityRepo::new();
         activity_repo.expect_log().returning(|_, _, _, _, _| ());
 
         let state = TestStateBuilder::new()
             .with_user_repo(user_repo)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1331,6 +1377,12 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(policy.clone())));
 
+        // Membership service for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         let mut drop_store = MockDropStore::new();
         // Verify that the drop is stored with once=true
         drop_store
@@ -1349,6 +1401,7 @@ mod tests {
             .with_drop_store(drop_store)
             .with_inbox_store(inbox_store)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1388,6 +1441,12 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(mock_policy(workspace_id))));
 
+        // Membership service for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         // External rate limit exceeded (50/month for external)
         let mut rate_limiter = MockRateLimiter::new();
         rate_limiter
@@ -1401,6 +1460,7 @@ mod tests {
             .with_user_repo(user_repo)
             .with_rate_limiter(rate_limiter)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1450,6 +1510,12 @@ mod tests {
             .expect_get_policy()
             .returning(move |_| Ok(Some(mock_policy(workspace_id))));
 
+        // Membership service for activity logging
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(|_| Ok(None));
+
         // No rate limiter expectations - internal sends should NOT check rate limit
         let rate_limiter = MockRateLimiter::new();
 
@@ -1468,6 +1534,7 @@ mod tests {
             .with_inbox_store(inbox_store)
             .with_rate_limiter(rate_limiter)
             .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
             .with_activity_repo(activity_repo)
             .build();
 
@@ -1479,5 +1546,231 @@ mod tests {
 
         let response = result.into_response();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Activity logging tests
+
+    #[tokio::test]
+    async fn create_drop_logs_activity_for_admin_without_verified_domain() {
+        // Admin whose domain is NOT verified should still get activity logged
+        let sender = mock_user("admin@unverified.com");
+        let sender_id = sender.id;
+        let recipient = mock_user("recipient@example.com");
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        // Domain lookup returns None (domain not verified) - for rate limiting
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(|_| Ok(None));
+
+        // Membership service returns admin membership - for activity logging
+        let workspace_clone = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone.clone(),
+                    is_admin: true,
+                }))
+            });
+
+        // Free tier rate limiting (since domain not verified)
+        let mut rate_limiter = MockRateLimiter::new();
+        rate_limiter
+            .expect_check_monthly()
+            .returning(|_, _, _, _| Ok(RateLimitResult::Allowed(1)));
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_store().returning(|_, _| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_add().returning(|_, _, _| Ok(()));
+
+        // Key assertion: activity.log() should be called
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_log()
+            .withf(move |ws_id, event_type, actor_id, _, _| {
+                *ws_id == workspace_id
+                    && event_type == "drop.sent"
+                    && *actor_id == sender_id
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_rate_limiter(rate_limiter)
+            .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let payload = mock_create_drop_payload("recipient@example.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_drop_logs_activity_for_domain_member() {
+        // Non-admin with verified domain should get activity logged
+        let sender = mock_user("member@acme.com");
+        let sender_id = sender.id;
+        let recipient = mock_user("colleague@acme.com");
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let mut user_repo = MockUserRepo::new();
+        let sender_clone = sender.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(sender_clone.clone())));
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_verified_by_email()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let workspace_clone = workspace.clone();
+        let workspace_clone2 = workspace.clone();
+        let mut workspace_repo = MockWorkspaceRepo::new();
+        // Domain IS verified - returns workspace for rate limiting
+        workspace_repo
+            .expect_find_paid_by_domain()
+            .returning(move |_| Ok(Some(workspace_clone.clone())));
+        workspace_repo
+            .expect_get_verified_domains()
+            .returning(|_| Ok(vec!["acme.com".to_string()]));
+        workspace_repo
+            .expect_get_policy()
+            .returning(move |_| Ok(Some(mock_policy(workspace_clone2.id))));
+
+        // Membership service returns domain membership - for activity logging
+        let workspace_clone3 = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone3.clone(),
+                    is_admin: false,
+                }))
+            });
+
+        let mut drop_store = MockDropStore::new();
+        drop_store.expect_store().returning(|_, _| Ok(()));
+
+        let mut inbox_store = MockInboxStore::new();
+        inbox_store.expect_add().returning(|_, _, _| Ok(()));
+
+        // Key assertion: activity.log() should be called
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_log()
+            .withf(move |ws_id, event_type, actor_id, _, _| {
+                *ws_id == workspace_id
+                    && event_type == "drop.sent"
+                    && *actor_id == sender_id
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_inbox_store(inbox_store)
+            .with_workspace_repo(workspace_repo)
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let payload = mock_create_drop_payload("colleague@acme.com");
+        let result = create_drop(AuthUser { id: sender_id }, State(state), Json(payload))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn get_drop_logs_activity_when_sender_is_admin() {
+        // When recipient opens a drop, activity should be logged to sender's workspace
+        // even if sender's domain is not verified (but sender is admin)
+        let recipient = mock_user("recipient@example.com");
+        let recipient_id = recipient.id;
+        let workspace = mock_workspace();
+        let workspace_id = workspace.id;
+
+        let drop = mock_stored_drop("admin@unverified.com", "recipient@example.com");
+        let drop_id: Uuid = drop.id.parse().unwrap();
+
+        let mut user_repo = MockUserRepo::new();
+        let recipient_clone = recipient.clone();
+        user_repo
+            .expect_find_by_id()
+            .returning(move |_| Ok(Some(recipient_clone.clone())));
+
+        let mut drop_store = MockDropStore::new();
+        let drop_clone = drop.clone();
+        drop_store
+            .expect_get()
+            .returning(move |_| Ok(Some(drop_clone.clone())));
+
+        // Membership service returns sender's workspace via admin path
+        let workspace_clone = workspace.clone();
+        let mut membership_service = MockWorkspaceMembership::new();
+        membership_service
+            .expect_get_paid_membership_by_email()
+            .returning(move |_| {
+                Ok(Some(MembershipInfo {
+                    workspace: workspace_clone.clone(),
+                    is_admin: true,
+                }))
+            });
+
+        // Activity should be logged
+        let mut activity_repo = MockActivityRepo::new();
+        activity_repo
+            .expect_log()
+            .withf(move |ws_id, event_type, actor_id, _, _| {
+                *ws_id == workspace_id
+                    && event_type == "drop.opened"
+                    && *actor_id == recipient_id
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| ());
+
+        let state = TestStateBuilder::new()
+            .with_user_repo(user_repo)
+            .with_drop_store(drop_store)
+            .with_membership_service(membership_service)
+            .with_activity_repo(activity_repo)
+            .build();
+
+        let result = get_drop(AuthUser { id: recipient_id }, State(state), Path(drop_id))
+            .await
+            .unwrap();
+
+        let response = result.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

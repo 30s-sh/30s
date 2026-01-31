@@ -24,7 +24,8 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::models::{Device, StoredDrop, User, Workspace, WorkspacePolicy};
 use crate::repos::{
-    MockActivityRepo, MockDeviceRepo, MockStatusRepo, MockUserRepo, MockWorkspaceRepo, Repos,
+    MockActivityRepo, MockDeviceRepo, MockStatusRepo, MockUserRepo, MockWorkspaceMembership,
+    MockWorkspaceRepo, Repos,
 };
 use crate::services::{MockAuthService, MockDnsResolver, MockEmailSender};
 use crate::state::AppState;
@@ -127,6 +128,7 @@ pub struct TestStateBuilder {
     workspace_repo: Option<MockWorkspaceRepo>,
     activity_repo: Option<MockActivityRepo>,
     status_repo: Option<MockStatusRepo>,
+    membership_service: Option<MockWorkspaceMembership>,
     drop_store: Option<MockDropStore>,
     inbox_store: Option<MockInboxStore>,
     verification_store: Option<MockVerificationStore>,
@@ -145,6 +147,7 @@ impl TestStateBuilder {
             workspace_repo: None,
             activity_repo: None,
             status_repo: None,
+            membership_service: None,
             drop_store: None,
             inbox_store: None,
             verification_store: None,
@@ -178,6 +181,11 @@ impl TestStateBuilder {
     #[allow(dead_code)]
     pub fn with_status_repo(mut self, repo: MockStatusRepo) -> Self {
         self.status_repo = Some(repo);
+        self
+    }
+
+    pub fn with_membership_service(mut self, service: MockWorkspaceMembership) -> Self {
+        self.membership_service = Some(service);
         self
     }
 
@@ -225,6 +233,10 @@ impl TestStateBuilder {
             workspaces: Arc::new(self.workspace_repo.unwrap_or_else(MockWorkspaceRepo::new)),
             activity: Arc::new(self.activity_repo.unwrap_or_else(MockActivityRepo::new)),
             status: Arc::new(self.status_repo.unwrap_or_else(MockStatusRepo::new)),
+            membership: Arc::new(
+                self.membership_service
+                    .unwrap_or_else(MockWorkspaceMembership::new),
+            ),
         };
 
         let stores = Stores {
