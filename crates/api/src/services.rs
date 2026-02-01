@@ -32,9 +32,11 @@ mod auth;
 mod dns;
 mod email;
 pub mod unkey;
+mod webhook;
 
 pub use auth::{AuthService, UnkeyAuthService};
 pub use dns::{DnsResolver, HickoryDnsResolver};
+pub use webhook::{DropReceivedEvent, HttpWebhookSender, WebhookSender};
 
 #[cfg(test)]
 pub use dns::MockDnsResolver;
@@ -45,3 +47,6 @@ pub use auth::{CreateKeyResult, MockAuthService};
 
 #[cfg(test)]
 pub use email::MockEmailSender;
+
+#[cfg(test)]
+pub use webhook::MockWebhookSender;

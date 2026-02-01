@@ -361,6 +361,34 @@ pub struct ActivityLogQuery {
     pub limit: Option<i32>,
 }
 
+// ============================================================================
+// Webhook types
+// ============================================================================
+
+/// Request to set a webhook URL.
+#[derive(Debug, Serialize, Deserialize, Validate)]
+pub struct SetWebhookPayload {
+    /// Webhook URL (must be HTTPS in production).
+    #[garde(url, length(max = 2048))]
+    pub url: String,
+}
+
+/// Webhook configuration response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// The configured webhook URL.
+    pub url: String,
+    /// The HMAC secret for verifying webhook signatures.
+    pub secret: String,
+}
+
+/// Response from sending a test webhook.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookTestResponse {
+    /// Success message.
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

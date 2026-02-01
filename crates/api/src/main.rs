@@ -27,10 +27,10 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use crate::{
     config::Config,
     repos::{
-        PgActivityRepo, PgDeviceRepo, PgStatusRepo, PgUserRepo, PgWorkspaceMembership,
-        PgWorkspaceRepo, Repos,
+        PgActivityRepo, PgDeviceRepo, PgStatusRepo, PgUserRepo, PgWebhookRepo,
+        PgWorkspaceMembership, PgWorkspaceRepo, Repos,
     },
-    services::{EmailSenderImpl, HickoryDnsResolver, UnkeyAuthService, unkey},
+    services::{EmailSenderImpl, HickoryDnsResolver, HttpWebhookSender, UnkeyAuthService, unkey},
     state::AppState,
     stores::{RedisDropStore, RedisInboxStore, RedisRateLimiter, RedisVerificationStore, Stores},
 };
@@ -113,8 +113,9 @@ async fn main() -> Result<()> {
         devices: std::sync::Arc::new(PgDeviceRepo::new(database.clone())),
         workspaces,
         activity: std::sync::Arc::new(PgActivityRepo::new(database.clone())),
-        status: std::sync::Arc::new(PgStatusRepo::new(database)),
+        status: std::sync::Arc::new(PgStatusRepo::new(database.clone())),
         membership,
+        webhooks: std::sync::Arc::new(PgWebhookRepo::new(database)),
     };
 
     // Build stores
@@ -128,6 +129,9 @@ async fn main() -> Result<()> {
     // Build auth service
     let auth = std::sync::Arc::new(UnkeyAuthService::new(unkey));
 
+    // Build webhook sender
+    let webhook = HttpWebhookSender::new();
+
     let state = AppState {
         config: config.clone(),
         repos,
@@ -136,6 +140,7 @@ async fn main() -> Result<()> {
         email: std::sync::Arc::new(email),
         dns: std::sync::Arc::new(dns),
         stripe,
+        webhook: std::sync::Arc::new(webhook),
     };
 
     // Request ID header name
@@ -149,6 +154,7 @@ async fn main() -> Result<()> {
         .nest("/drops", handlers::drops::router())
         .nest("/workspace", handlers::workspace::router())
         .nest("/workspace", handlers::activity::router())
+        .nest("/webhooks", handlers::webhooks::router())
         .with_state(state)
         // Request ID: generate UUID, include in logs, return in response
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
