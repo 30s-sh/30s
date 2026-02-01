@@ -11,5 +11,6 @@ pub mod logout;
 pub mod open;
 pub mod rotate;
 pub mod send;
+pub mod webhooks;
 pub mod whoami;
 pub mod workspace;

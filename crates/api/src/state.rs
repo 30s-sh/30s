@@ -5,7 +5,7 @@ use stripe::Client as StripeClient;
 use crate::{
     config::Config,
     repos::Repos,
-    services::{AuthService, DnsResolver, EmailSender},
+    services::{AuthService, DnsResolver, EmailSender, WebhookSender},
     stores::Stores,
 };
 
@@ -25,4 +25,6 @@ pub struct AppState {
     pub dns: Arc<dyn DnsResolver>,
     /// Stripe client.
     pub stripe: StripeClient,
+    /// Webhook sender.
+    pub webhook: Arc<dyn WebhookSender>,
 }

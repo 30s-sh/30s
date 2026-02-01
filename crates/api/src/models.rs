@@ -79,6 +79,19 @@ pub struct WorkspaceActivityLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// Account-level webhook configuration.
+///
+/// Users can configure a webhook URL to receive notifications when they receive drops.
+/// Each webhook is assigned a unique secret for HMAC signature verification.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct Webhook {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub url: String,
+    pub secret: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Drop stored in Redis with automatic expiration via TTL.
 ///
 /// Drops are ephemeral encrypted secrets. The server only stores ciphertext and

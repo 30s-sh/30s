@@ -30,6 +30,8 @@
 //! - GET /drops/{id} - Retrieve a specific drop (verifies recipient access)
 //! - DELETE /drops/{id} - Delete a drop (sender only)
 
+use std::collections::HashSet;
+
 use axum::{
     Json, Router, debug_handler,
     extract::{Path, State},
@@ -47,6 +49,7 @@ use crate::{
     middleware::auth::AuthUser,
     models::StoredDrop,
     repos::{events, is_internal_send},
+    services::DropReceivedEvent,
     state::AppState,
 };
 
@@ -98,12 +101,21 @@ async fn create_drop(
     // not specifically domain verification.
     let user_membership = state.repos.membership.get_paid_membership(user.id).await?;
 
-    // Collect recipient emails
-    let recipient_emails: Vec<String> = payload
-        .wrapped_keys
-        .iter()
-        .map(|wk| wk.recipient_email.clone())
-        .collect();
+    // Collect unique recipient emails (wrapped_keys has one entry per device, not per user)
+    let recipient_emails: Vec<String> = {
+        let mut seen = HashSet::new();
+        payload
+            .wrapped_keys
+            .iter()
+            .filter_map(|wk| {
+                if seen.insert(wk.recipient_email.clone()) {
+                    Some(wk.recipient_email.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
     // Track applied policies for response
     let mut applied_policies: Option<AppliedPolicies> = None;
@@ -344,6 +356,28 @@ async fn create_drop(
             .inbox
             .add(*user_id, &drop_id.to_string(), expiration_score)
             .await?;
+    }
+
+    // Fire webhooks for each recipient (fire-and-forget)
+    for (recipient_user_id, recipient_email) in
+        recipient_user_ids.iter().zip(recipient_emails.iter())
+    {
+        if let Ok(Some(webhook)) = state.repos.webhooks.get_by_user(*recipient_user_id).await {
+            let event = DropReceivedEvent {
+                event: "drop.received",
+                drop_id: drop_id.to_string(),
+                sender_email: sender.email.clone(),
+                recipient_email: recipient_email.clone(),
+                expires_at: effective_expires_at,
+                timestamp: now,
+            };
+            let webhook_sender = state.webhook.clone();
+            let url = webhook.url;
+            let secret = webhook.secret;
+            tokio::spawn(async move {
+                webhook_sender.send_drop_received(&url, &secret, event).await;
+            });
+        }
     }
 
     tracing::info!(

@@ -24,10 +24,10 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::models::{Device, StoredDrop, User, Workspace, WorkspacePolicy};
 use crate::repos::{
-    MockActivityRepo, MockDeviceRepo, MockStatusRepo, MockUserRepo, MockWorkspaceMembership,
-    MockWorkspaceRepo, Repos,
+    MockActivityRepo, MockDeviceRepo, MockStatusRepo, MockUserRepo, MockWebhookRepo,
+    MockWorkspaceMembership, MockWorkspaceRepo, Repos,
 };
-use crate::services::{MockAuthService, MockDnsResolver, MockEmailSender};
+use crate::services::{MockAuthService, MockDnsResolver, MockEmailSender, MockWebhookSender};
 use crate::state::AppState;
 use crate::stores::{
     MockDropStore, MockInboxStore, MockRateLimiter, MockVerificationStore, Stores,
@@ -129,6 +129,7 @@ pub struct TestStateBuilder {
     activity_repo: Option<MockActivityRepo>,
     status_repo: Option<MockStatusRepo>,
     membership_service: Option<MockWorkspaceMembership>,
+    webhook_repo: Option<MockWebhookRepo>,
     drop_store: Option<MockDropStore>,
     inbox_store: Option<MockInboxStore>,
     verification_store: Option<MockVerificationStore>,
@@ -136,6 +137,7 @@ pub struct TestStateBuilder {
     auth_service: Option<MockAuthService>,
     email_sender: Option<MockEmailSender>,
     dns_resolver: Option<MockDnsResolver>,
+    webhook_sender: Option<MockWebhookSender>,
 }
 
 impl TestStateBuilder {
@@ -148,6 +150,7 @@ impl TestStateBuilder {
             activity_repo: None,
             status_repo: None,
             membership_service: None,
+            webhook_repo: None,
             drop_store: None,
             inbox_store: None,
             verification_store: None,
@@ -155,6 +158,7 @@ impl TestStateBuilder {
             auth_service: None,
             email_sender: None,
             dns_resolver: None,
+            webhook_sender: None,
         }
     }
 
@@ -186,6 +190,11 @@ impl TestStateBuilder {
 
     pub fn with_membership_service(mut self, service: MockWorkspaceMembership) -> Self {
         self.membership_service = Some(service);
+        self
+    }
+
+    pub fn with_webhook_repo(mut self, repo: MockWebhookRepo) -> Self {
+        self.webhook_repo = Some(repo);
         self
     }
 
@@ -225,6 +234,11 @@ impl TestStateBuilder {
         self
     }
 
+    pub fn with_webhook_sender(mut self, sender: MockWebhookSender) -> Self {
+        self.webhook_sender = Some(sender);
+        self
+    }
+
     /// Builds the `AppState` using configured mocks or defaults.
     pub fn build(self) -> AppState {
         let repos = Repos {
@@ -237,6 +251,7 @@ impl TestStateBuilder {
                 self.membership_service
                     .unwrap_or_else(MockWorkspaceMembership::new),
             ),
+            webhooks: Arc::new(self.webhook_repo.unwrap_or_else(default_webhook_repo)),
         };
 
         let stores = Stores {
@@ -255,6 +270,8 @@ impl TestStateBuilder {
             as Arc<dyn crate::services::EmailSender>;
         let dns = Arc::new(self.dns_resolver.unwrap_or_else(MockDnsResolver::new))
             as Arc<dyn crate::services::DnsResolver>;
+        let webhook = Arc::new(self.webhook_sender.unwrap_or_else(MockWebhookSender::new))
+            as Arc<dyn crate::services::WebhookSender>;
         let stripe = stripe::Client::new("sk_test_xxx");
 
         AppState {
@@ -265,6 +282,7 @@ impl TestStateBuilder {
             email,
             dns,
             stripe,
+            webhook,
         }
     }
 }
@@ -273,4 +291,11 @@ impl Default for TestStateBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Creates a default webhook repo mock that returns None for get_by_user.
+fn default_webhook_repo() -> MockWebhookRepo {
+    let mut repo = MockWebhookRepo::new();
+    repo.expect_get_by_user().returning(|_| Ok(None));
+    repo
 }

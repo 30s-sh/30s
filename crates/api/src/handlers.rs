@@ -4,4 +4,5 @@ pub mod billing;
 pub mod devices;
 pub mod drops;
 pub mod health;
+pub mod webhooks;
 pub mod workspace;

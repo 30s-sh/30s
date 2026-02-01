@@ -7,8 +7,9 @@ use shared::api::{
     CreateCheckoutSessionResponse, CreateDropPayload, CreateDropResponse,
     CreatePortalSessionResponse, CreateWorkspacePayload, DeviceInfo, DevicePublicKey, DomainInfo,
     Drop, GetPublicKeysPayload, InboxItem, MeResponse, RegisterDevicePayload, RequestCodePayload,
-    RotateVerifyPayload, RotateVerifyResponse, UpdatePoliciesPayload, VerifyCodePayload,
-    VerifyCodeResponse, VerifyDomainResponse, WorkspaceInfo, WorkspacePolicies,
+    RotateVerifyPayload, RotateVerifyResponse, SetWebhookPayload, UpdatePoliciesPayload,
+    VerifyCodePayload, VerifyCodeResponse, VerifyDomainResponse, WebhookConfig,
+    WebhookTestResponse, WorkspaceInfo, WorkspacePolicies,
 };
 
 pub struct Api {
@@ -427,6 +428,65 @@ impl Api {
 
         let response =
             Self::check_response(self.http.get(&url).bearer_auth(key).send().await?).await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Sets a webhook URL for the authenticated user.
+    pub async fn set_webhook(&self, key: String, url: &str) -> Result<WebhookConfig> {
+        let response = Self::check_response(
+            self.http
+                .put(format!("{}/webhooks", self.base_url))
+                .bearer_auth(key)
+                .json(&SetWebhookPayload {
+                    url: url.to_string(),
+                })
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Gets the current webhook configuration.
+    pub async fn get_webhook(&self, key: String) -> Result<WebhookConfig> {
+        let response = Self::check_response(
+            self.http
+                .get(format!("{}/webhooks", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Clears the webhook configuration.
+    pub async fn clear_webhook(&self, key: String) -> Result<()> {
+        Self::check_response(
+            self.http
+                .delete(format!("{}/webhooks", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sends a test webhook event.
+    pub async fn test_webhook(&self, key: String) -> Result<WebhookTestResponse> {
+        let response = Self::check_response(
+            self.http
+                .post(format!("{}/webhooks/test", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await?,
+        )
+        .await?;
 
         Ok(response.json().await?)
     }

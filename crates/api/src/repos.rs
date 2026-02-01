@@ -27,6 +27,7 @@ mod devices;
 mod membership;
 mod status;
 mod users;
+mod webhooks;
 mod workspaces;
 
 pub use activity::{events, is_internal_send, ActivityQuery, ActivityRepo, PgActivityRepo};
@@ -34,6 +35,7 @@ pub use devices::{DeviceRepo, PgDeviceRepo};
 pub use membership::{PgWorkspaceMembership, WorkspaceMembership};
 pub use status::{PgStatusRepo, StatusRepo};
 pub use users::{PgUserRepo, UserRepo};
+pub use webhooks::{PgWebhookRepo, WebhookRepo};
 pub use workspaces::{PgWorkspaceRepo, WorkspaceRepo};
 
 #[cfg(test)]
@@ -46,6 +48,8 @@ pub use membership::{MembershipInfo, MockWorkspaceMembership};
 pub use status::MockStatusRepo;
 #[cfg(test)]
 pub use users::MockUserRepo;
+#[cfg(test)]
+pub use webhooks::MockWebhookRepo;
 #[cfg(test)]
 pub use workspaces::MockWorkspaceRepo;
 
@@ -60,4 +64,5 @@ pub struct Repos {
     pub activity: Arc<dyn ActivityRepo>,
     pub status: Arc<dyn StatusRepo>,
     pub membership: Arc<dyn WorkspaceMembership>,
+    pub webhooks: Arc<dyn WebhookRepo>,
 }

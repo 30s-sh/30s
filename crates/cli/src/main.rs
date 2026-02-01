@@ -190,6 +190,20 @@ enum Commands {
         all: bool,
     },
 
+    /// Manage webhooks for drop notifications
+    #[command(after_help = "Examples:
+  30s webhooks                            Show current webhook config
+  30s webhooks set https://example.com    Set webhook URL
+  30s webhooks test                       Send a test event
+  30s webhooks clear                      Remove webhook")]
+    Webhooks {
+        #[command(subcommand)]
+        action: Option<WebhookCommands>,
+
+        /// Webhook URL (when using 'set')
+        url: Option<String>,
+    },
+
     /// Generate shell completions
     #[command(after_help = "Examples:
   30s completions bash > ~/.bash_completion.d/30s
@@ -322,6 +336,22 @@ enum PolicyCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum WebhookCommands {
+    /// Set webhook URL (generates new secret)
+    #[command(after_help = "Example: 30s webhooks set https://example.com/webhook")]
+    Set {
+        /// Webhook URL to receive notifications
+        url: String,
+    },
+    /// Send a test webhook event
+    #[command(after_help = "Example: 30s webhooks test")]
+    Test,
+    /// Clear webhook configuration
+    #[command(after_help = "Example: 30s webhooks clear")]
+    Clear,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -427,6 +457,15 @@ async fn run() -> anyhow::Result<()> {
             limit,
             all,
         } => commands::activity::run(&config, since, event_type, limit, all).await,
+        Commands::Webhooks { action, url } => match action {
+            Some(WebhookCommands::Set { url }) => commands::webhooks::set(&config, &url).await,
+            Some(WebhookCommands::Test) => commands::webhooks::test(&config).await,
+            Some(WebhookCommands::Clear) => commands::webhooks::clear(&config).await,
+            None => match url {
+                Some(u) => commands::webhooks::set(&config, &u).await,
+                None => commands::webhooks::show(&config).await,
+            },
+        },
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "30s", &mut std::io::stdout());
             Ok(())
